@@ -328,7 +328,7 @@ function Window:Clamp()
 	local cy = self.Main.Position.Y.Scale * view.Y
 	local minX = margin - halfWidth
 	local maxX = math.max(minX, view.X - margin + halfWidth)
-	local minY = 50 - halfHeight
+	local minY = halfHeight
 	local maxY = math.max(minY, view.Y - 44 + halfHeight)
 	cx = math.clamp(cx, minX, maxX)
 	cy = math.clamp(cy, minY, maxY)
@@ -393,6 +393,7 @@ function Window:SetHidden(state)
 	if self.Closed or self.Hidden == state then
 		return
 	end
+	self:CloseDialog()
 	self.Hidden = state
 	self.Token = self.Token + 1
 	local token = self.Token
@@ -434,6 +435,7 @@ end
 function Window:Dialog(config)
 	config = config or {}
 	self:CloseDialog()
+	local inside = not self.Hidden
 	local overlay = Create("Frame", {
 		Name = "Dialog",
 		Size = UDim2.fromScale(1, 1),
@@ -442,10 +444,12 @@ function Window:Dialog(config)
 		BorderSizePixel = 0,
 		Active = true,
 		ZIndex = 100,
-		Parent = self.Gui
+		Parent = inside and self.Main or self.Gui
 	})
 	self.ActiveDialog = overlay
-	Animate(overlay, {BackgroundTransparency = 0.5}, 0.18)
+	if inside then
+		Animate(overlay, {BackgroundTransparency = 0.45}, 0.18)
+	end
 
 	local box = self:Make("Frame", {
 		AnchorPoint = Vector2.new(0.5, 0.5),
@@ -1977,8 +1981,8 @@ function Window:CreateSettingsTab(name, icon)
 	})
 	tab:CreateToggle({
 		Name = "Pinch To Zoom",
-		Description = "Use two fingers on the screen to resize the menu",
-		Default = true,
+		Description = "Two fingers on the menu resize it",
+		Default = false,
 		Callback = function(state)
 			self.PinchEnabled = state
 		end
@@ -2066,7 +2070,7 @@ function Graphite:CreateWindow(config)
 	self.OnClose = config.OnClose
 	self.Hidden = false
 	self.Closed = false
-	self.PinchEnabled = true
+	self.PinchEnabled = false
 	self.Token = 0
 	self.Fade = 0
 	self.MinSize = Vector2.new(380, 250)
@@ -2393,15 +2397,31 @@ function Graphite:CreateWindow(config)
 		end
 	end)
 
+	local function BothOnMenu(positions)
+		local origin = main.AbsolutePosition
+		local size = main.AbsoluteSize
+		for _, point in ipairs(positions) do
+			if point.X < origin.X or point.X > origin.X + size.X or point.Y < origin.Y or point.Y > origin.Y + size.Y then
+				return false
+			end
+		end
+		return #positions > 1
+	end
+
 	local pinchBase
-	self:Connect(UserInputService.TouchPinch, function(_, pinchScale, _, state)
+	self:Connect(UserInputService.TouchPinch, function(positions, pinchScale, _, state)
 		if self.Hidden or self.Closed or not self.PinchEnabled then
+			pinchBase = nil
 			return
 		end
 		if state == Enum.UserInputState.Begin then
-			pinchBase = self.TargetScale
-		elseif state == Enum.UserInputState.Change and pinchBase then
-			self:SetScale(pinchBase * pinchScale)
+			pinchBase = BothOnMenu(positions) and self.TargetScale or nil
+		elseif state == Enum.UserInputState.Change then
+			if pinchBase and BothOnMenu(positions) then
+				self:SetScale(pinchBase * pinchScale)
+			end
+		else
+			pinchBase = nil
 		end
 	end)
 
