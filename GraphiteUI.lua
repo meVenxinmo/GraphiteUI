@@ -7,6 +7,8 @@ local Workspace = game:GetService("Workspace")
 local HttpService = game:GetService("HttpService")
 local Stats = game:GetService("Stats")
 local TextService = game:GetService("TextService")
+local TeleportService = game:GetService("TeleportService")
+local MarketplaceService = game:GetService("MarketplaceService")
 
 local LocalPlayer = Players.LocalPlayer
 local Touch = UserInputService.TouchEnabled
@@ -25,10 +27,11 @@ local function C(r, g, b)
 	return Color3.fromRGB(r, g, b)
 end
 
-local DefaultBase = C(40, 40, 43)
+local DefaultBase = C(8, 8, 8)
 
 local Motion = {Reduce = false, Performance = false}
 local ActiveWindow
+local PendingLoad
 local ErrorLog = {message = nil, time = 0}
 
 local NoteColors = {
@@ -64,10 +67,53 @@ local function BuildTheme(base, text, accent)
 		theme.Hover = Shift(base, 0.25)
 		theme.Stroke = Shift(base, -0.2)
 	end
-	theme.Text = text or (dark and C(235, 235, 238) or C(28, 28, 32))
+	theme.Text = text or (dark and C(255, 255, 255) or C(28, 28, 32))
 	theme.Sub = theme.Text:Lerp(base, 0.42)
 	theme.Accent = accent or (dark and Shift(base, 0.6) or Shift(base, -0.55))
 	return theme
+end
+
+local GamesFile = "Bio.Menu.Games.txt"
+
+local function Duration(total)
+	total = math.max(0, math.floor(total))
+	return string.format("%02d:%02d:%02d", math.floor(total / 3600), math.floor(total % 3600 / 60), total % 60)
+end
+
+local function LoadGames()
+	local list = {}
+	if type(isfile) ~= "function" or type(readfile) ~= "function" then
+		return list
+	end
+	local ok, text = pcall(function()
+		if isfile(GamesFile) then
+			return readfile(GamesFile)
+		end
+	end)
+	if ok and type(text) == "string" then
+		for line in string.gmatch(text, "[^\r\n]+") do
+			local id, stamp, name = string.match(line, "^(%d+)|(%d+)|(.*)$")
+			if id then
+				table.insert(list, {id = tonumber(id), time = tonumber(stamp), name = name})
+			end
+		end
+	end
+	return list
+end
+
+local function SaveGames(list)
+	if type(writefile) ~= "function" then
+		return
+	end
+	local lines = {}
+	for index, entry in ipairs(list) do
+		if index > 10 then
+			break
+		end
+		local name = string.gsub(tostring(entry.name), "[|\r\n]", " ")
+		table.insert(lines, entry.id .. "|" .. entry.time .. "|" .. name)
+	end
+	pcall(writefile, GamesFile, table.concat(lines, "\n"))
 end
 
 local function Create(class, props)
@@ -134,33 +180,46 @@ local function IsPointer(input)
 	return input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch
 end
 
-local function Fire(callback, ...)
+local function Report(err)
+	warn("[Graphite] " .. tostring(err))
+	local window = ActiveWindow
+	if not window or window.Closed then
+		return
+	end
+	local message = string.match(tostring(err), "[^\n]+") or "Unknown error"
+	message = string.gsub(message, "^.-:%d+:%s*", "")
+	if #message > 90 then
+		message = string.sub(message, 1, 90) .. "..."
+	end
+	local now = os.clock()
+	if ErrorLog.message == message and now - ErrorLog.time < 3 then
+		return
+	end
+	ErrorLog.message = message
+	ErrorLog.time = now
+	window:Notify({Title = "Error", Content = message, Type = "Error", Duration = 5})
+end
+
+local function FireWith(callback, done, ...)
 	if type(callback) ~= "function" then
+		if done then
+			done(true)
+		end
 		return
 	end
 	task.spawn(function(...)
 		local ok, err = pcall(callback, ...)
-		if ok then
-			return
+		if not ok then
+			Report(err)
 		end
-		warn("[Graphite] " .. tostring(err))
-		local window = ActiveWindow
-		if not window or window.Closed then
-			return
+		if done then
+			done(ok)
 		end
-		local message = string.match(tostring(err), "[^\n]+") or "Unknown error"
-		message = string.gsub(message, "^.-:%d+:%s*", "")
-		if #message > 90 then
-			message = string.sub(message, 1, 90) .. "..."
-		end
-		local now = os.clock()
-		if ErrorLog.message == message and now - ErrorLog.time < 3 then
-			return
-		end
-		ErrorLog.message = message
-		ErrorLog.time = now
-		window:Notify({Title = "Error", Content = message, Type = "Error", Duration = 5})
 	end, ...)
+end
+
+local function Fire(callback, ...)
+	FireWith(callback, nil, ...)
 end
 
 local function ViewSize(gui)
@@ -386,7 +445,7 @@ end
 function Window:SetLocked(state)
 	self.Locked = state == true
 	if self.Grip then
-		self.Grip.Visible = not self.Locked
+		self.Grip.Visible = not self.Locked and not self.Focus
 	end
 	if self.LockToggle then
 		self.LockToggle:Set(self.Locked, true)
@@ -547,6 +606,478 @@ function Window:MoveIndicator(tab, instant)
 	end
 end
 
+function Window:OpenMenu()
+	self.Gated = false
+	if self.Closed then
+		return
+	end
+	self.Main.Visible = true
+	self.Main.GroupTransparency = 1
+	self.UIScale.Scale = self.TargetScale * 0.85
+	Animate(self.UIScale, {Scale = self.TargetScale}, 0.35, Enum.EasingStyle.Back)
+	Animate(self.Main, {GroupTransparency = self.Fade}, 0.25)
+	self.Born = os.clock()
+	if self.CurrentTab then
+		self:Stagger(self.CurrentTab.Page)
+	end
+end
+
+function Window:GateCard(width, height)
+	local card = self:Make("CanvasGroup", {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.fromOffset(width, height or 0),
+		AutomaticSize = height and Enum.AutomaticSize.None or Enum.AutomaticSize.Y,
+		BorderSizePixel = 0,
+		GroupTransparency = 1,
+		Parent = self.Gui
+	}, {BackgroundColor3 = "Top"})
+	Round(card, 10)
+	local edge = Create("Frame", {
+		Position = UDim2.fromOffset(1, 1),
+		Size = UDim2.new(1, -2, 1, -2),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		ZIndex = 20,
+		Parent = card
+	})
+	Round(edge, 9)
+	self:Stroke(edge)
+	local pop = Create("UIScale", {Scale = 0.9, Parent = card})
+	Animate(pop, {Scale = 1}, 0.3, Enum.EasingStyle.Back)
+	Animate(card, {GroupTransparency = 0}, 0.2)
+	return card
+end
+
+function Window:CloseCard(card, after)
+	local tween = Animate(card, {GroupTransparency = 1}, 0.2)
+	tween.Completed:Connect(function()
+		card:Destroy()
+		if after then
+			after()
+		end
+	end)
+end
+
+function Window:ShowLoading(config, seconds, done)
+	local card = self:GateCard(320, 150)
+	local orbit = Create("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromOffset(44, 42),
+		Size = UDim2.fromOffset(40, 40),
+		BackgroundTransparency = 1,
+		Parent = card
+	})
+	local custom = ParseImage(config.Spinner)
+	if custom then
+		local paints = nil
+		if not config.KeepSpinnerColor then
+			paints = {ImageColor3 = "Accent"}
+		end
+		self:Make("ImageLabel", {
+			Size = UDim2.fromScale(1, 1),
+			BackgroundTransparency = 1,
+			Image = custom,
+			Parent = orbit
+		}, paints)
+	else
+		local ring = Create("Frame", {
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.fromScale(0.5, 0.5),
+			Size = UDim2.fromOffset(32, 32),
+			BackgroundTransparency = 1,
+			BorderSizePixel = 0,
+			Parent = orbit
+		})
+		Create("UICorner", {CornerRadius = UDim.new(1, 0), Parent = ring})
+		local ringStroke = Create("UIStroke", {Thickness = 3, Transparency = 0.45, Parent = ring})
+		self:Paint(ringStroke, "Color", "Stroke")
+		local dot = self:Make("Frame", {
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.fromOffset(20, 4),
+			Size = UDim2.fromOffset(10, 10),
+			BorderSizePixel = 0,
+			Parent = orbit
+		}, {BackgroundColor3 = "Accent"})
+		Create("UICorner", {CornerRadius = UDim.new(1, 0), Parent = dot})
+	end
+	local spin = TweenService:Create(
+		orbit,
+		TweenInfo.new(0.9, Enum.EasingStyle.Linear, Enum.EasingDirection.Out, -1),
+		{Rotation = 360}
+	)
+	spin:Play()
+	table.insert(self.Connections, {
+		Disconnect = function()
+			spin:Cancel()
+		end
+	})
+
+	self:Make("TextLabel", {
+		Position = UDim2.fromOffset(78, 20),
+		Size = UDim2.new(1, -98, 0, 24),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.GothamBold,
+		TextSize = 17,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		Text = config.Title or self.Name,
+		Parent = card
+	}, {TextColor3 = "Text"})
+	local status = self:Make("TextLabel", {
+		Position = UDim2.fromOffset(78, 46),
+		Size = UDim2.new(1, -98, 0, 16),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.Gotham,
+		TextSize = 12,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		Text = config.Text or "Loading...",
+		Parent = card
+	}, {TextColor3 = "Sub"})
+	local track = self:Make("Frame", {
+		Position = UDim2.fromOffset(22, 88),
+		Size = UDim2.new(1, -44, 0, 8),
+		BorderSizePixel = 0,
+		Parent = card
+	}, {BackgroundColor3 = "Stroke"})
+	Round(track, 4)
+	local fill = self:Make("Frame", {
+		Size = UDim2.new(0, 0, 1, 0),
+		BorderSizePixel = 0,
+		Parent = track
+	}, {BackgroundColor3 = "Accent"})
+	Round(fill, 4)
+	local tips = {
+		"Drag the top bar to move the menu.",
+		"Drag the bottom corner to resize it.",
+		"Open Settings to change the colors.",
+		"Press the + button to bring a hidden menu back."
+	}
+	self:Make("TextLabel", {
+		Position = UDim2.fromOffset(22, 108),
+		Size = UDim2.new(1, -90, 0, 28),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.Gotham,
+		TextSize = 11,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextWrapped = true,
+		Text = config.Tip or tips[math.random(1, #tips)],
+		Parent = card
+	}, {TextColor3 = "Sub"})
+	local percent = self:Make("TextLabel", {
+		AnchorPoint = Vector2.new(1, 0),
+		Position = UDim2.new(1, -22, 0, 108),
+		Size = UDim2.fromOffset(60, 18),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.GothamBold,
+		TextSize = 12,
+		TextXAlignment = Enum.TextXAlignment.Right,
+		Text = "0%",
+		Parent = card
+	}, {TextColor3 = "Text"})
+
+	local stages = {config.Text or "Loading...", "Preparing menu...", "Almost ready..."}
+	local connection = fill:GetPropertyChangedSignal("Size"):Connect(function()
+		local ratio = fill.Size.X.Scale
+		percent.Text = string.format("%d%%", math.floor(ratio * 100 + 0.5))
+		status.Text = stages[ratio < 0.4 and 1 or (ratio < 0.85 and 2 or 3)]
+	end)
+	table.insert(self.Connections, connection)
+	local tween = Linear(fill, {Size = UDim2.new(1, 0, 1, 0)}, seconds)
+	tween.Completed:Connect(function()
+		connection:Disconnect()
+		spin:Cancel()
+		if self.Closed then
+			return
+		end
+		percent.Text = "100%"
+		self:CloseCard(card, done)
+	end)
+end
+
+function Window:CheckKey(config, key)
+	key = (string.gsub(tostring(key or ""), "^%s*(.-)%s*$", "%1"))
+	if key == "" then
+		return false
+	end
+	if type(config.Validate) == "function" then
+		local ok, result = pcall(config.Validate, key)
+		if ok and result then
+			return true
+		end
+	end
+	for _, valid in ipairs(config.Keys or {}) do
+		if key == valid then
+			return true
+		end
+	end
+	if type(config.Url) == "string" then
+		local ok, body = pcall(function()
+			return game:HttpGet(config.Url)
+		end)
+		if ok and type(body) == "string" then
+			for line in string.gmatch(body, "[^\r\n]+") do
+				if (string.gsub(line, "^%s*(.-)%s*$", "%1")) == key then
+					return true
+				end
+			end
+		end
+	end
+	return false
+end
+
+function Window:ShowKeyGate(options, done)
+	local config = options
+	if type(config) == "string" then
+		config = {Keys = {config}}
+	elseif type(config) == "table" and config.Keys == nil and config.Url == nil and config.Validate == nil and config.Key == nil and #config > 0 then
+		config = {Keys = config}
+	end
+	if type(config) ~= "table" then
+		done()
+		return
+	end
+	if config.Key and not config.Keys then
+		config.Keys = {config.Key}
+	end
+	local links = {}
+	if type(config.Links) == "table" then
+		for _, link in ipairs(config.Links) do
+			table.insert(links, link)
+		end
+	end
+	if type(config.Link) == "string" then
+		table.insert(links, config.Link)
+	end
+	local file = config.File or "Bio.Menu.Key.txt"
+	local save = config.Save ~= false
+	if save and type(isfile) == "function" and type(readfile) == "function" then
+		local ok, saved = pcall(function()
+			if isfile(file) then
+				return readfile(file)
+			end
+		end)
+		if ok and type(saved) == "string" and saved ~= "" and self:CheckKey(config, saved) then
+			done()
+			return
+		end
+	end
+
+	local card = self:GateCard(330, nil)
+	local body = Create("Frame", {
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1,
+		Parent = card
+	})
+	Pad(body, 18, 16, 18, 16)
+	Create("UIListLayout", {Padding = UDim.new(0, 10), SortOrder = Enum.SortOrder.LayoutOrder, Parent = body})
+	local order = 0
+	local function Next()
+		order = order + 1
+		return order
+	end
+	self:Make("TextLabel", {
+		LayoutOrder = Next(),
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1,
+		Font = Enum.Font.GothamBold,
+		TextSize = 17,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextWrapped = true,
+		Text = config.Title or "Key System",
+		Parent = body
+	}, {TextColor3 = "Text"})
+	self:Make("TextLabel", {
+		LayoutOrder = Next(),
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1,
+		Font = Enum.Font.Gotham,
+		TextSize = 12,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextWrapped = true,
+		Text = config.Note or "Enter your key to continue.",
+		Parent = body
+	}, {TextColor3 = "Sub"})
+	local linkBox
+	if #links > 0 then
+		linkBox = self:Make("TextBox", {
+			LayoutOrder = Next(),
+			Size = UDim2.new(1, 0, 0, 30),
+			BorderSizePixel = 0,
+			Font = Enum.Font.Gotham,
+			TextSize = 11,
+			ClearTextOnFocus = false,
+			TextEditable = false,
+			TextTruncate = Enum.TextTruncate.AtEnd,
+			Text = links[1],
+			Parent = body
+		}, {BackgroundColor3 = "Top", TextColor3 = "Sub"})
+		Round(linkBox, 6)
+		self:Stroke(linkBox)
+	end
+	local keyBox = self:Make("TextBox", {
+		LayoutOrder = Next(),
+		Size = UDim2.new(1, 0, 0, 36),
+		BorderSizePixel = 0,
+		Font = Enum.Font.Gotham,
+		TextSize = 13,
+		PlaceholderText = "Enter your key",
+		ClearTextOnFocus = false,
+		Text = "",
+		Parent = body
+	}, {BackgroundColor3 = "Top", TextColor3 = "Text", PlaceholderColor3 = "Sub"})
+	Round(keyBox, 6)
+	self:Stroke(keyBox)
+	local status = self:Make("TextLabel", {
+		LayoutOrder = Next(),
+		Size = UDim2.new(1, 0, 0, 16),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.Gotham,
+		TextSize = 12,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		Text = "",
+		Parent = body
+	}, {TextColor3 = "Sub"})
+	local buttons = Create("Frame", {
+		LayoutOrder = Next(),
+		Size = UDim2.new(1, 0, 0, 38),
+		BackgroundTransparency = 1,
+		Parent = body
+	})
+	Create("UIListLayout", {
+		FillDirection = Enum.FillDirection.Horizontal,
+		Padding = UDim.new(0, 8),
+		SortOrder = Enum.SortOrder.LayoutOrder,
+		Parent = buttons
+	})
+
+	local linkCount = math.min(#links, 3)
+	local total = linkCount + 1
+	local function MakeButton(text, index, callback)
+		local button = self:Make("TextButton", {
+			LayoutOrder = index,
+			Size = UDim2.new(1 / total, -8 * (total - 1) / total, 1, 0),
+			BorderSizePixel = 0,
+			AutoButtonColor = false,
+			ClipsDescendants = true,
+			Font = Enum.Font.GothamMedium,
+			TextSize = 13,
+			Text = text,
+			Parent = buttons
+		}, {BackgroundColor3 = "Element", TextColor3 = "Text"})
+		Round(button, 6)
+		Hover(self, button)
+		self:Pressable(button)
+		button.MouseButton1Click:Connect(callback)
+		return button
+	end
+
+	local function SetStatus(text, kind)
+		status.Text = text
+		status.TextColor3 = kind == "error" and NoteColors.Error or (kind == "success" and NoteColors.Success or self.Theme.Sub)
+	end
+
+	local function Shake()
+		if not self:Fancy() then
+			return
+		end
+		local base = card.Position
+		local offsets = {10, -10, 6, 0}
+		local index = 0
+		local function Step()
+			index = index + 1
+			local offset = offsets[index]
+			if offset == nil then
+				return
+			end
+			local tween = Animate(card, {Position = UDim2.new(base.X.Scale, base.X.Offset + offset, base.Y.Scale, base.Y.Offset)}, 0.05)
+			tween.Completed:Connect(Step)
+		end
+		Step()
+	end
+
+	for index = 1, linkCount do
+		MakeButton(linkCount > 1 and ("Get Key " .. index) or "Get Key", index, function()
+			local link = links[index]
+			if linkBox then
+				linkBox.Text = link
+			end
+			local copied = false
+			if type(setclipboard) == "function" then
+				copied = pcall(setclipboard, link)
+			end
+			SetStatus(copied and "Link copied. Open it in your browser." or "Copy the link above and open it in your browser.", "info")
+		end)
+	end
+
+	local busy = false
+	local function Submit()
+		if busy then
+			return
+		end
+		local text = keyBox.Text
+		if text == "" then
+			SetStatus("Please enter a key.", "error")
+			Shake()
+			return
+		end
+		busy = true
+		SetStatus("Checking...", "info")
+		task.spawn(function()
+			local valid = self:CheckKey(config, text)
+			busy = false
+			if self.Closed then
+				return
+			end
+			if valid then
+				SetStatus("Key accepted.", "success")
+				if save and type(writefile) == "function" then
+					pcall(writefile, file, text)
+				end
+				self:CloseCard(card, done)
+			else
+				SetStatus("Wrong key. Try again.", "error")
+				Shake()
+			end
+		end)
+	end
+
+	MakeButton("Check Key", total, Submit)
+	keyBox.FocusLost:Connect(function(enter)
+		if enter then
+			Submit()
+		end
+	end)
+end
+
+function Window:RunGate(config)
+	local seconds
+	if config.Min and config.Max then
+		local low = math.min(config.Min, config.Max)
+		local high = math.max(config.Min, config.Max)
+		seconds = low + math.random() * (high - low)
+	else
+		seconds = config.Time or config.Seconds or 5
+	end
+	seconds = math.clamp(seconds, 0.3, 120)
+	local function Finish()
+		if self.Closed then
+			return
+		end
+		if config.Key then
+			self:ShowKeyGate(config.Key, function()
+				self:OpenMenu()
+			end)
+		else
+			self:OpenMenu()
+		end
+	end
+	self:ShowLoading(config, seconds, Finish)
+end
+
 function Window:Rebuild()
 	self.Theme = BuildTheme(self.Base, self.TextColor, self.AccentColor)
 	self:RunHooks()
@@ -597,6 +1128,13 @@ function Window:SetTitle(text)
 	self.Name = text
 	self.TitleLabel.Text = text
 	self.BarLabel.Text = text
+	local width = math.min(TextService:GetTextSize(text, 13, Enum.Font.GothamMedium, Vector2.new(400, 30)).X + 6, 170)
+	self.TitleLabel.Size = UDim2.new(0, width, 1, 0)
+	if self.Strip then
+		local stripX = self.TitleOffset + width + 10
+		self.Strip.Position = UDim2.fromOffset(stripX, 0)
+		self.Strip.Size = UDim2.new(1, -(stripX + self.ButtonsWidth), 1, 0)
+	end
 end
 
 function Window:Clamp()
@@ -672,7 +1210,7 @@ function Window:ResetLayout()
 end
 
 function Window:SetHidden(state)
-	if self.Closed or self.Hidden == state then
+	if self.Closed or self.Gated or self.Hidden == state then
 		return
 	end
 	self:CloseDialog()
@@ -1190,6 +1728,9 @@ function Window:SelectTab(tab)
 		other.Render(0.14)
 	end
 	self.CurrentTab = tab
+	if not tab.IsSettings then
+		self.LastContentTab = tab
+	end
 	self:MoveIndicator(tab, previous == nil)
 	if previous ~= tab and self:Fancy() then
 		if tab.PageTween then
@@ -1266,6 +1807,8 @@ function Window:CreateTab(name, icon)
 	tab.Button = button
 	tab.Page = page
 	tab.Scroller = page
+	tab.Root = tab
+	tab.Controls = {}
 
 	function tab.Render(time)
 		local theme = self.Theme
@@ -1402,6 +1945,14 @@ local function Register(win, flag, object)
 	end
 end
 
+function Tab:Track(object, default)
+	local root = self.Root or self
+	if root.Controls then
+		table.insert(root.Controls, {object = object, default = default})
+	end
+	return object
+end
+
 function Tab:CreateGroup(config)
 	config = config or {}
 	local win = self.Window
@@ -1523,11 +2074,22 @@ function Tab:CreateGroup(config)
 	header.MouseButton1Click:Connect(function()
 		Apply(not open, true)
 	end)
+	table.insert(win.Groups, {
+		Set = function(state)
+			if state ~= open then
+				Apply(state, true)
+			end
+		end,
+		Open = function()
+			return open
+		end
+	})
 
 	local group = setmetatable({}, Tab)
 	group.Window = win
 	group.Page = body
 	group.Scroller = self.Scroller
+	group.Root = self.Root or self
 	group.Order = 0
 	group.Title = title
 	return group
@@ -1736,16 +2298,94 @@ end
 function Tab:CreateButton(config)
 	config = config or {}
 	local win = self.Window
-	local row = NewRow(self, config.Description and (RowHeight + 14) or RowHeight, "TextButton")
-	local label = RowLabel(win, row, config.Name or "Button", 24, config.Icon, config.Description, config.KeepIconColor)
+	local height = config.Description and (RowHeight + 20) or (RowHeight + 6)
+	local row = NewRow(self, height, "TextButton")
+	local label, note = RowLabel(win, row, config.Name or "Button", 84, config.Icon, config.Description, config.KeepIconColor)
+	label.Font = Enum.Font.GothamMedium
+	label.TextSize = 14
+	if note then
+		label.Position = UDim2.new(0, label.Position.X.Offset, 0, 9)
+		note.Position = UDim2.new(0, note.Position.X.Offset, 0, 31)
+	else
+		label.Size = UDim2.new(label.Size.X.Scale, label.Size.X.Offset, 1, 0)
+	end
 	Hover(win, row)
 	win:Pressable(row)
-	row.MouseButton1Click:Connect(function()
-		Fire(config.Callback)
+
+	local bar = Create("Frame", {
+		AnchorPoint = Vector2.new(0, 0.5),
+		Position = UDim2.new(0, 0, 0.5, 0),
+		Size = UDim2.fromOffset(3, 0),
+		BorderSizePixel = 0,
+		Parent = row
+	})
+	Round(bar, 2)
+	win:Bind(function()
+		bar.BackgroundColor3 = config.Danger and NoteColors.Error or win.Theme.Accent
 	end)
+	row.MouseEnter:Connect(function()
+		Animate(bar, {Size = UDim2.fromOffset(3, height - 20)}, 0.14)
+	end)
+	row.MouseLeave:Connect(function()
+		Animate(bar, {Size = UDim2.fromOffset(3, 0)}, 0.14)
+	end)
+
+	local status = win:Make("TextLabel", {
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, -12, 0.5, 0),
+		Size = UDim2.fromOffset(72, 20),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.GothamBold,
+		TextSize = 11,
+		TextXAlignment = Enum.TextXAlignment.Right,
+		TextTransparency = 1,
+		Text = "",
+		Parent = row
+	}, {TextColor3 = "Sub"})
+
+	local token = 0
+	local function Show(text, color)
+		token = token + 1
+		local current = token
+		status.Text = text
+		status.TextColor3 = color
+		status.TextTransparency = 1
+		Animate(status, {TextTransparency = 0}, 0.12)
+		task.delay(1.4, function()
+			if current == token and status.Parent then
+				Animate(status, {TextTransparency = 1}, 0.25)
+			end
+		end)
+	end
+
+	local function Run()
+		FireWith(config.Callback, function(ok)
+			if win.Closed or not row.Parent then
+				return
+			end
+			if ok then
+				Show("OK", NoteColors.Success)
+				row.BackgroundColor3 = win.Theme.Element:Lerp(NoteColors.Success, 0.28)
+			else
+				Show("Failed", NoteColors.Error)
+				row.BackgroundColor3 = win.Theme.Element:Lerp(NoteColors.Error, 0.28)
+			end
+			Animate(row, {BackgroundColor3 = win.Theme.Element}, 0.5)
+		end)
+	end
+	row.MouseButton1Click:Connect(Run)
+
 	local object = {}
 	function object:SetText(value)
 		label.Text = value
+	end
+	function object:SetDescription(value)
+		if note then
+			note.Text = value
+		end
+	end
+	function object:Run()
+		Run()
 	end
 	return object
 end
@@ -1833,7 +2473,7 @@ function Tab:CreateToggle(config)
 	row.MouseButton1Click:Connect(function()
 		object:Set(not state)
 	end)
-	return object
+	return self:Track(object, config.Default == true)
 end
 
 function Tab:CreateSlider(config)
@@ -1842,20 +2482,37 @@ function Tab:CreateSlider(config)
 	local min = config.Min or 0
 	local max = config.Max or 100
 	local step = config.Increment or 1
+	if step <= 0 then
+		step = 1
+	end
 	local suffix = config.Suffix
 	if suffix == nil then
 		suffix = "%"
 	end
-	local value = math.clamp(config.Default or min, min, max)
-	local row = NewRow(self, RowHeight + 24)
+	local default = math.clamp(config.Default or min, min, max)
+	local value = default
+	local decimals = 0
+	local probe = step
+	while decimals < 4 and math.abs(probe - math.floor(probe + 0.0001)) > 0.0001 do
+		probe = probe * 10
+		decimals = decimals + 1
+	end
+	local function Format(number)
+		return string.format("%." .. decimals .. "f", number)
+	end
+	local stepper = config.Stepper ~= false
+	local reserve = stepper and 148 or 92
+	local row = NewRow(self, RowHeight + 52)
 
 	local title = RowLabel(win, row, config.Name or "Slider", 24, config.Icon, nil, config.KeepIconColor)
-	title.Size = UDim2.new(1, -(title.Position.X.Offset + 86), 0, 34)
+	title.Font = Enum.Font.GothamMedium
+	title.Size = UDim2.new(1, -(title.Position.X.Offset + reserve), 0, RowHeight)
 
+	local controlY = (RowHeight - 26) / 2
 	local box = win:Make("TextBox", {
 		AnchorPoint = Vector2.new(1, 0),
-		Position = UDim2.new(1, -10, 0, 6),
-		Size = UDim2.fromOffset(70, 24),
+		Position = UDim2.new(1, stepper and -40 or -10, 0, controlY),
+		Size = UDim2.fromOffset(72, 26),
 		BorderSizePixel = 0,
 		Font = Enum.Font.GothamMedium,
 		TextSize = 12,
@@ -1866,8 +2523,29 @@ function Tab:CreateSlider(config)
 	Round(box, 6)
 	win:Stroke(box)
 
+	local function StepButton(text, offset)
+		local button = win:Make("TextButton", {
+			AnchorPoint = Vector2.new(1, 0),
+			Position = UDim2.new(1, offset, 0, controlY),
+			Size = UDim2.fromOffset(26, 26),
+			BorderSizePixel = 0,
+			AutoButtonColor = false,
+			ClipsDescendants = true,
+			Font = Enum.Font.GothamBold,
+			TextSize = 16,
+			Text = text,
+			Parent = row
+		}, {BackgroundColor3 = "Top", TextColor3 = "Text"})
+		Round(button, 6)
+		win:Stroke(button)
+		Hover(win, button, "Top", "Hover")
+		win:Pressable(button, "Top")
+		return button
+	end
+
+	local trackY = RowHeight + 6
 	local track = win:Make("Frame", {
-		Position = UDim2.new(0, 14, 0, RowHeight + 6),
+		Position = UDim2.new(0, 14, 0, trackY),
 		Size = UDim2.new(1, -28, 0, 8),
 		BorderSizePixel = 0,
 		Parent = row
@@ -1886,6 +2564,61 @@ function Tab:CreateSlider(config)
 	})
 	local glow = Create("UIStroke", {Thickness = 0, Transparency = 0.55, Parent = fill})
 	win:Paint(glow, "Color", "Accent")
+
+	local divisions = (max - min) / step
+	local tickCount = 0
+	if config.Ticks == false or max == min then
+		tickCount = 0
+	elseif type(config.Ticks) == "number" then
+		tickCount = math.clamp(math.floor(config.Ticks), 1, 20)
+	elseif divisions <= 20 then
+		tickCount = math.max(math.floor(divisions + 0.5), 1)
+	else
+		tickCount = 4
+	end
+	if tickCount > 0 then
+		local marks = Create("Frame", {
+			Position = UDim2.new(0, 14, 0, trackY + 19),
+			Size = UDim2.new(1, -28, 0, 8),
+			BackgroundTransparency = 1,
+			Parent = row
+		})
+		for index = 0, tickCount do
+			local tall = index == 0 or index == tickCount
+			win:Make("Frame", {
+				AnchorPoint = Vector2.new(0.5, 0),
+				Position = UDim2.fromScale(index / tickCount, 0),
+				Size = UDim2.fromOffset(1, tall and 7 or 4),
+				BorderSizePixel = 0,
+				Parent = marks
+			}, {BackgroundColor3 = "Stroke"})
+		end
+	end
+
+	if config.ShowRange ~= false then
+		win:Make("TextLabel", {
+			Position = UDim2.new(0, 14, 0, trackY + 30),
+			Size = UDim2.fromOffset(90, 12),
+			BackgroundTransparency = 1,
+			Font = Enum.Font.Gotham,
+			TextSize = 10,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			Text = Format(min) .. suffix,
+			Parent = row
+		}, {TextColor3 = "Sub"})
+		win:Make("TextLabel", {
+			AnchorPoint = Vector2.new(1, 0),
+			Position = UDim2.new(1, -14, 0, trackY + 30),
+			Size = UDim2.fromOffset(90, 12),
+			BackgroundTransparency = 1,
+			Font = Enum.Font.Gotham,
+			TextSize = 10,
+			TextXAlignment = Enum.TextXAlignment.Right,
+			Text = Format(max) .. suffix,
+			Parent = row
+		}, {TextColor3 = "Sub"})
+	end
+
 	local knob = Create("Frame", {
 		AnchorPoint = Vector2.new(0.5, 0.5),
 		Position = UDim2.fromScale(0, 0.5),
@@ -1897,29 +2630,48 @@ function Tab:CreateSlider(config)
 	})
 	Round(knob, 9)
 	win:Make("UIStroke", {Thickness = 2, Parent = knob}, {Color = "Accent"})
+	local bubble = win:Make("TextLabel", {
+		AnchorPoint = Vector2.new(0.5, 1),
+		Position = UDim2.new(0.5, 0, 0, -8),
+		Size = UDim2.fromOffset(0, 22),
+		AutomaticSize = Enum.AutomaticSize.X,
+		BackgroundTransparency = 1,
+		TextTransparency = 1,
+		BorderSizePixel = 0,
+		Font = Enum.Font.GothamMedium,
+		TextSize = 12,
+		Text = "",
+		ZIndex = 6,
+		Parent = knob
+	}, {BackgroundColor3 = "Top", TextColor3 = "Text"})
+	Round(bubble, 6)
+	Pad(bubble, 8, 0, 8, 0)
+
 	local hit = Create("TextButton", {
-		Position = UDim2.new(0, 6, 0, RowHeight - 6),
+		Position = UDim2.new(0, 6, 0, RowHeight - 2),
 		Size = UDim2.new(1, -12, 0, 30),
 		BackgroundTransparency = 1,
 		Text = "",
 		Parent = row
 	})
 
-	local object = {}
-	function object:Set(newValue, silent)
+	local object = {Default = default}
+	function object:Set(newValue, silent, smooth)
 		newValue = math.clamp(newValue, min, max)
-		newValue = math.floor(newValue / step + 0.5) * step
-		newValue = tonumber(string.format("%.4f", newValue))
-		value = math.clamp(newValue, min, max)
+		newValue = math.floor((newValue - min) / step + 0.5) * step + min
+		newValue = math.clamp(tonumber(string.format("%.4f", newValue)), min, max)
+		value = newValue
 		local alpha = max == min and 0 or (value - min) / (max - min)
-		if not silent and win:Fancy() then
-			Animate(fill, {Size = UDim2.fromScale(alpha, 1)}, 0.08)
-			Animate(knob, {Position = UDim2.fromScale(alpha, 0.5)}, 0.08)
+		if smooth and win:Fancy() then
+			Animate(fill, {Size = UDim2.fromScale(alpha, 1)}, 0.12)
+			Animate(knob, {Position = UDim2.fromScale(alpha, 0.5)}, 0.12)
 		else
 			fill.Size = UDim2.fromScale(alpha, 1)
 			knob.Position = UDim2.fromScale(alpha, 0.5)
 		end
-		box.Text = tostring(value) .. suffix
+		local text = Format(value) .. suffix
+		box.Text = text
+		bubble.Text = text
 		if not silent then
 			win:Touch(config.Flag)
 			Fire(config.Callback, value)
@@ -1931,13 +2683,22 @@ function Tab:CreateSlider(config)
 	object:Set(value, true)
 	Register(win, config.Flag, object)
 
+	if stepper then
+		StepButton("-", -116).MouseButton1Click:Connect(function()
+			object:Set(value - step, false, true)
+		end)
+		StepButton("+", -10).MouseButton1Click:Connect(function()
+			object:Set(value + step, false, true)
+		end)
+	end
+
 	box.Focused:Connect(function()
-		box.Text = tostring(value)
+		box.Text = Format(value)
 	end)
 	box.FocusLost:Connect(function()
 		local parsed = tonumber(string.match(box.Text, "-?%d+%.?%d*"))
 		if parsed then
-			object:Set(parsed)
+			object:Set(parsed, false, true)
 		else
 			object:Set(value, true)
 		end
@@ -1951,11 +2712,13 @@ function Tab:CreateSlider(config)
 			Animate(glow, {Thickness = 4}, 0.15)
 		end
 		Animate(knob, {Size = UDim2.fromOffset(21, 21)}, 0.12, Enum.EasingStyle.Back)
+		Animate(bubble, {BackgroundTransparency = 0, TextTransparency = 0}, 0.12)
 	end, function()
 		Animate(glow, {Thickness = 0}, 0.2)
 		Animate(knob, {Size = UDim2.fromOffset(18, 18)}, 0.12)
+		Animate(bubble, {BackgroundTransparency = 1, TextTransparency = 1}, 0.15)
 	end)
-	return object
+	return self:Track(object, default)
 end
 
 function Tab:CreateProgress(config)
@@ -2041,7 +2804,7 @@ function Tab:CreateInput(config)
 		return box.Text
 	end
 	Register(win, config.Flag, object)
-	return object
+	return self:Track(object, config.Default or "")
 end
 
 function Tab:CreateKeybind(config)
@@ -2100,7 +2863,7 @@ function Tab:CreateKeybind(config)
 		return key
 	end
 	Register(win, config.Flag, object)
-	return object
+	return self:Track(object, config.Default or Enum.KeyCode.Unknown)
 end
 
 function Tab:CreateDropdown(config)
@@ -2321,7 +3084,7 @@ function Tab:CreateDropdown(config)
 		open = not open
 		Resize()
 	end)
-	return object
+	return self:Track(object, config.Default)
 end
 
 function Tab:CreateColorPicker(config)
@@ -2560,11 +3323,870 @@ function Tab:CreateColorPicker(config)
 		return color
 	end
 	Register(win, config.Flag, object)
-	return object
+	return self:Track(object, original)
+end
+
+function Window:ApplyBody()
+	local menu = not self.OnTop
+	self.Side.Visible = menu and self.SidebarVisible
+	self.Content.Visible = menu
+	self.TopContent.Visible = not menu
+end
+
+function Window:AddTopEntry(name, icon, page)
+	local entry = {Name = name, Page = page, Active = false}
+	local image = ParseImage(icon)
+	local textWidth = TextService:GetTextSize(name, 12, Enum.Font.GothamMedium, Vector2.new(400, 20)).X
+	local width = textWidth + 24 + (image and 20 or 0)
+	local pill = Create("TextButton", {
+		Name = name,
+		LayoutOrder = #self.TopEntries + 1,
+		Size = UDim2.fromOffset(width, TopHeight - 12),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		AutoButtonColor = false,
+		Text = "",
+		Parent = self.Strip
+	})
+	Round(pill, 6)
+	local iconLabel
+	if image then
+		iconLabel = Create("ImageLabel", {
+			AnchorPoint = Vector2.new(0, 0.5),
+			Position = UDim2.new(0, 8, 0.5, 0),
+			Size = UDim2.fromOffset(14, 14),
+			BackgroundTransparency = 1,
+			Image = image,
+			Parent = pill
+		})
+	end
+	local label = Create("TextLabel", {
+		Position = UDim2.fromOffset(image and 26 or 0, 0),
+		Size = UDim2.new(1, image and -26 or 0, 1, 0),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.GothamMedium,
+		TextSize = 12,
+		Text = name,
+		Parent = pill
+	})
+	function entry.Render(time)
+		local theme = self.Theme
+		Animate(pill, {
+			BackgroundTransparency = entry.Active and 0 or 1,
+			BackgroundColor3 = theme.Hover
+		}, time)
+		Animate(label, {TextColor3 = entry.Active and theme.Text or theme.Sub}, time)
+		if iconLabel then
+			Animate(iconLabel, {ImageColor3 = entry.Active and theme.Text or theme.Sub}, time)
+		end
+	end
+	self:Bind(function()
+		entry.Render(0)
+	end)
+	pill.MouseEnter:Connect(function()
+		if not entry.Active then
+			Animate(pill, {BackgroundTransparency = 0.6}, 0.1)
+		end
+	end)
+	pill.MouseLeave:Connect(function()
+		if not entry.Active then
+			Animate(pill, {BackgroundTransparency = 1}, 0.1)
+		end
+	end)
+	pill.MouseButton1Click:Connect(function()
+		self:SelectTop(entry)
+	end)
+	table.insert(self.TopEntries, entry)
+	self.Strip.Visible = #self.TopEntries > 1
+	return entry
+end
+
+function Window:SelectTop(entry)
+	if self.TopSelected == entry then
+		return
+	end
+	local previous = self.TopSelected
+	for _, other in ipairs(self.TopEntries) do
+		other.Active = other == entry
+		other.Render(0.14)
+		if other.Page then
+			other.Page.Visible = other.Active
+		end
+	end
+	self.TopSelected = entry
+	self.OnTop = entry.Page ~= nil
+	self:ApplyBody()
+	if previous and previous.OnHide then
+		previous.OnHide()
+	end
+	if entry.Page then
+		if self:Fancy() then
+			if entry.PageTween then
+				entry.PageTween:Cancel()
+			end
+			entry.Page.Position = UDim2.fromOffset(0, 14)
+			entry.PageTween = Animate(entry.Page, {Position = UDim2.fromOffset(0, 0)}, 0.2)
+			self:Stagger(entry.Page)
+		else
+			entry.Page.Position = UDim2.fromOffset(0, 0)
+		end
+	end
+	if entry.OnShow then
+		entry.OnShow()
+	end
+end
+
+function Window:BuildTopPage(name, icon)
+	local tab = setmetatable({}, Tab)
+	tab.Window = self
+	tab.Name = name
+	tab.Order = 0
+	tab.Active = false
+	tab.IsTop = true
+	local page = self:Make("ScrollingFrame", {
+		Name = name,
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		ScrollBarThickness = 3,
+		CanvasSize = UDim2.new(),
+		AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		Visible = false,
+		Parent = self.TopContent
+	}, {ScrollBarImageColor3 = "Stroke"})
+	Create("UIListLayout", {Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder, Parent = page})
+	Pad(page, 10, 10, 12, 10)
+	tab.Page = page
+	tab.Scroller = page
+	tab.Root = tab
+	tab.Controls = {}
+	local entry = self:AddTopEntry(name, icon, page)
+	tab.Entry = entry
+	return tab, entry
+end
+
+function Window:CreateTopTab(name, icon)
+	if self.CustomTop >= 4 then
+		warn("[Graphite] Only 4 custom top tabs are allowed")
+		self:Status("Error", "Only 4 custom top tabs are allowed")
+		return nil
+	end
+	self.CustomTop = self.CustomTop + 1
+	local tab = self:BuildTopPage(name or "Tab", icon)
+	table.insert(self.TopTabs, tab)
+	return tab
+end
+
+Window.CreateHeaderTab = Window.CreateTopTab
+
+function Window:Teleport(placeId, jobId, what)
+	local function Go()
+		self:Status("Updated", "Joining " .. what .. "...")
+		local ok, err = pcall(function()
+			if jobId then
+				TeleportService:TeleportToPlaceInstance(placeId, jobId, LocalPlayer)
+			else
+				TeleportService:Teleport(placeId, LocalPlayer)
+			end
+		end)
+		if not ok then
+			self:Status("Error", "Could not join: " .. tostring(err))
+		end
+	end
+	if self.ConfirmTeleport then
+		self:Confirm("Do you want to join " .. what .. "?", Go)
+	else
+		Go()
+	end
+end
+
+function Window:FetchServers(order)
+	local url = string.format("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=%s&limit=100", game.PlaceId, order)
+	local ok, body = pcall(function()
+		return game:HttpGet(url)
+	end)
+	if not ok or type(body) ~= "string" then
+		return nil, "The server list is not available here"
+	end
+	local decoded, data = pcall(function()
+		return HttpService:JSONDecode(body)
+	end)
+	if not decoded or type(data) ~= "table" or type(data.data) ~= "table" then
+		return nil, "The server list could not be read"
+	end
+	return data.data
+end
+
+function Window:PickServer(mode)
+	local list, problem = self:FetchServers(mode == "Emptiest" and "Asc" or "Desc")
+	if not list then
+		return nil, problem
+	end
+	local candidates = {}
+	for _, server in ipairs(list) do
+		local playing = server.playing
+		if server.id ~= game.JobId and type(playing) == "number" and playing >= 1 and playing < (server.maxPlayers or math.huge) then
+			table.insert(candidates, server)
+		end
+	end
+	if #candidates == 0 then
+		return nil, "No other server was found"
+	end
+	if mode == "Random" then
+		return candidates[math.random(1, #candidates)]
+	end
+	return candidates[1]
+end
+
+function Window:JoinServer(mode)
+	local server, problem = self:PickServer(mode)
+	if not server then
+		error(problem, 0)
+	end
+	self:Teleport(game.PlaceId, server.id, "a server with " .. tostring(server.playing) .. " players")
+end
+
+local function InfoRow(tab, name, clickable)
+	local win = tab.Window
+	local row = NewRow(tab, RowHeight - 2, clickable and "TextButton" or nil)
+	win:Make("TextLabel", {
+		Position = UDim2.fromOffset(12, 0),
+		Size = UDim2.new(0.45, -12, 1, 0),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.Gotham,
+		TextSize = 12,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		Text = name,
+		Parent = row
+	}, {TextColor3 = "Sub"})
+	local value = win:Make("TextLabel", {
+		AnchorPoint = Vector2.new(1, 0),
+		Position = UDim2.new(1, -12, 0, 0),
+		Size = UDim2.new(0.55, -12, 1, 0),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.GothamMedium,
+		TextSize = 12,
+		TextXAlignment = Enum.TextXAlignment.Right,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		Text = "-",
+		Parent = row
+	}, {TextColor3 = "Text"})
+	return value, row
+end
+
+function Window:BuildGuide(config)
+	local tab, entry = self:BuildTopPage("Guide", nil)
+	tab.Locked = true
+	tab:CreateSection("Video Guide")
+	if config.GuideVideo then
+		local row = NewRow(tab, 176)
+		row.ClipsDescendants = true
+		local video = Create("VideoFrame", {
+			Size = UDim2.new(1, 0, 1, -36),
+			BackgroundColor3 = Color3.new(0, 0, 0),
+			BorderSizePixel = 0,
+			Video = ParseImage(config.GuideVideo),
+			Looped = false,
+			Volume = 0.6,
+			Parent = row
+		})
+		local playing = false
+		local toggle = self:Make("TextButton", {
+			AnchorPoint = Vector2.new(0, 1),
+			Position = UDim2.new(0, 8, 1, -6),
+			Size = UDim2.new(1, -16, 0, 26),
+			BorderSizePixel = 0,
+			AutoButtonColor = false,
+			Font = Enum.Font.GothamMedium,
+			TextSize = 12,
+			Text = "Play",
+			Parent = row
+		}, {BackgroundColor3 = "Top", TextColor3 = "Text"})
+		Round(toggle, 5)
+		toggle.MouseButton1Click:Connect(function()
+			playing = not playing
+			pcall(function()
+				if playing then
+					video:Play()
+				else
+					video:Pause()
+				end
+			end)
+			toggle.Text = playing and "Pause" or "Play"
+		end)
+		entry.OnHide = function()
+			if playing then
+				playing = false
+				toggle.Text = "Play"
+				pcall(function()
+					video:Pause()
+				end)
+			end
+		end
+	end
+	if config.GuideUrl then
+		tab:CreateButton({
+			Name = "Copy Video Link",
+			Description = "Copy the link, then open it in your browser",
+			Callback = function()
+				if type(setclipboard) ~= "function" then
+					error("The clipboard is not supported here", 0)
+				end
+				setclipboard(config.GuideUrl)
+			end
+		})
+	end
+	if not config.GuideVideo and not config.GuideUrl then
+		tab:CreateParagraph({Title = "No video yet", Content = "The menu author has not added a video guide."})
+	end
+	tab:CreateSection("Quick Guide")
+	tab:CreateParagraph({Title = "Move and resize", Content = "Drag the top bar or the sidebar to move the menu. Drag the bottom right corner to resize it."})
+	tab:CreateParagraph({Title = "Sliders", Content = "Drag the knob, type a value in the box, or use the - and + buttons for exact steps."})
+	tab:CreateParagraph({Title = "Buttons", Content = "A button shows OK when it worked and Failed when something went wrong."})
+	tab:CreateParagraph({Title = "Settings", Content = "Open Settings for colors, reset tools, Focus Mode, saving your values and the Bio.Menu.txt file."})
+end
+
+function Window:BuildProfile(config)
+	local tab, entry = self:BuildTopPage("Profile", nil)
+	tab.Locked = true
+	local player = LocalPlayer
+	local userId = player and player.UserId or 0
+
+	tab:CreateSection("Player")
+	local card = NewRow(tab, 92)
+	local avatar = self:Make("ImageLabel", {
+		Position = UDim2.fromOffset(14, 10),
+		Size = UDim2.fromOffset(72, 72),
+		BorderSizePixel = 0,
+		Image = "rbxthumb://type=AvatarHeadShot&id=" .. tostring(userId) .. "&w=150&h=150",
+		Parent = card
+	}, {BackgroundColor3 = "Top"})
+	Round(avatar, 36)
+	self:Stroke(avatar)
+	self:Make("TextLabel", {
+		Position = UDim2.fromOffset(100, 14),
+		Size = UDim2.new(1, -112, 0, 24),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.GothamBold,
+		TextSize = 16,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		Text = player and player.DisplayName or "Player",
+		Parent = card
+	}, {TextColor3 = "Text"})
+	self:Make("TextLabel", {
+		Position = UDim2.fromOffset(100, 40),
+		Size = UDim2.new(1, -112, 0, 18),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.Gotham,
+		TextSize = 12,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		Text = "@" .. (player and player.Name or "player"),
+		Parent = card
+	}, {TextColor3 = "Sub"})
+	self:Make("TextLabel", {
+		Position = UDim2.fromOffset(100, 60),
+		Size = UDim2.new(1, -112, 0, 18),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.Gotham,
+		TextSize = 12,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		Text = "ID " .. tostring(userId),
+		Parent = card
+	}, {TextColor3 = "Sub"})
+
+	tab:CreateSection("Account")
+	local created = InfoRow(tab, "Account Created")
+	local age = InfoRow(tab, "Account Age")
+	local member = InfoRow(tab, "Membership")
+
+	tab:CreateSection("Session")
+	local menuTime = InfoRow(tab, "Menu Time")
+	local clock = InfoRow(tab, "Current Time")
+	local gameName = InfoRow(tab, "Game")
+	local serverId, serverRow = InfoRow(tab, "Server ID", true)
+	local playerCount = InfoRow(tab, "Players In Server")
+	local ping = InfoRow(tab, "Ping")
+	Hover(self, serverRow)
+	serverRow.MouseButton1Click:Connect(function()
+		if type(setclipboard) == "function" and pcall(setclipboard, game.JobId) then
+			self:Status("Saved", "Server ID copied")
+		else
+			self:Status("Error", "The clipboard is not supported here")
+		end
+	end)
+
+	local recent = tab:CreateParagraph({Title = "Recent Games", Content = "-"})
+
+	local function Fill()
+		local days = player and player.AccountAge or 0
+		created.Text = os.date("%Y-%m-%d", os.time() - days * 86400)
+		age.Text = tostring(days) .. " days"
+		member.Text = (player and player.MembershipType and player.MembershipType.Name) or "Unknown"
+		local job = game.JobId
+		serverId.Text = job ~= "" and string.sub(job, 1, 13) or "Studio"
+	end
+
+	local function Record(name)
+		local list = LoadGames()
+		local now = os.time()
+		local id = game.PlaceId
+		local head = list[1]
+		if head and head.id == id and now - head.time < 3600 then
+			head.time = now
+			if name then
+				head.name = name
+			end
+		else
+			table.insert(list, 1, {id = id, time = now, name = name or ("Place " .. tostring(id))})
+		end
+		while #list > 10 do
+			table.remove(list)
+		end
+		SaveGames(list)
+		return list
+	end
+
+	local function ShowRecent(list)
+		local lines = {}
+		for index, item in ipairs(list) do
+			if index > 5 then
+				break
+			end
+			table.insert(lines, item.name .. "  -  " .. os.date("%m-%d %H:%M", item.time))
+		end
+		recent:SetContent(#lines > 0 and table.concat(lines, "\n") or "No games recorded yet")
+	end
+
+	local ticking = false
+	local function Tick()
+		if self.Closed or not entry.Active then
+			ticking = false
+			return
+		end
+		menuTime.Text = Duration(os.clock() - self.Created)
+		clock.Text = os.date("%H:%M:%S")
+		local count = #Players:GetPlayers()
+		playerCount.Text = count .. " / " .. tostring(Players.MaxPlayers or "?")
+		local ok, value = pcall(function()
+			return math.floor(Stats.Network.ServerStatsItem["Data Ping"]:GetValue() + 0.5)
+		end)
+		ping.Text = ok and (value .. " ms") or "-"
+		task.delay(1, Tick)
+	end
+
+	tab:CreateSection("Friends Online")
+	local listRow = NewRow(tab, 262)
+	local countLabel = self:Make("TextLabel", {
+		Position = UDim2.fromOffset(12, 0),
+		Size = UDim2.new(1, -24, 0, 26),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.GothamMedium,
+		TextSize = 12,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		Text = "Friends online: -",
+		Parent = listRow
+	}, {TextColor3 = "Sub"})
+	local friendList = self:Make("ScrollingFrame", {
+		Position = UDim2.fromOffset(6, 28),
+		Size = UDim2.new(1, -12, 1, -34),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		ScrollBarThickness = 3,
+		CanvasSize = UDim2.new(),
+		AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		Parent = listRow
+	}, {ScrollBarImageColor3 = "Stroke"})
+	Create("UIListLayout", {Padding = UDim.new(0, 5), SortOrder = Enum.SortOrder.LayoutOrder, Parent = friendList})
+	local empty = self:Make("TextLabel", {
+		LayoutOrder = 0,
+		Size = UDim2.new(1, -6, 0, 40),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.Gotham,
+		TextSize = 12,
+		Text = "Loading friends...",
+		Parent = friendList
+	}, {TextColor3 = "Sub"})
+	local moreButton = self:Make("TextButton", {
+		LayoutOrder = 100000,
+		Size = UDim2.new(1, -6, 0, 34),
+		BorderSizePixel = 0,
+		AutoButtonColor = false,
+		Font = Enum.Font.GothamMedium,
+		TextSize = 12,
+		Text = "Show more",
+		Visible = false,
+		Parent = friendList
+	}, {BackgroundColor3 = "Hover", TextColor3 = "Text"})
+	Round(moreButton, 6)
+
+	local friends = {}
+	local shown = 0
+	local fetched = false
+
+	local function AddRow(friend, index)
+		local row = self:Make("Frame", {
+			LayoutOrder = index,
+			Size = UDim2.new(1, -6, 0, 50),
+			BorderSizePixel = 0,
+			Parent = friendList
+		}, {BackgroundColor3 = "Top"})
+		row:SetAttribute("FriendRow", true)
+		Round(row, 6)
+		local photo = Create("ImageLabel", {
+			Position = UDim2.fromOffset(8, 7),
+			Size = UDim2.fromOffset(36, 36),
+			BackgroundTransparency = 1,
+			Image = "rbxthumb://type=AvatarHeadShot&id=" .. tostring(friend.VisitorId or 0) .. "&w=150&h=150",
+			Parent = row
+		})
+		Create("UICorner", {CornerRadius = UDim.new(1, 0), Parent = photo})
+		local joinable = type(friend.PlaceId) == "number" and type(friend.GameId) == "string" and friend.GameId ~= ""
+		local reserve = joinable and 76 or 60
+		self:Make("TextLabel", {
+			Position = UDim2.fromOffset(52, 6),
+			Size = UDim2.new(1, -(52 + reserve), 0, 18),
+			BackgroundTransparency = 1,
+			Font = Enum.Font.GothamMedium,
+			TextSize = 13,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			TextTruncate = Enum.TextTruncate.AtEnd,
+			Text = friend.DisplayName or friend.UserName or "Friend",
+			Parent = row
+		}, {TextColor3 = "Text"})
+		local where = "Online"
+		if friend.IsOnline == false then
+			where = "Offline"
+		elseif type(friend.LastLocation) == "string" and friend.LastLocation ~= "" then
+			where = friend.LastLocation
+		end
+		self:Make("TextLabel", {
+			Position = UDim2.fromOffset(52, 26),
+			Size = UDim2.new(1, -(52 + reserve), 0, 16),
+			BackgroundTransparency = 1,
+			Font = Enum.Font.Gotham,
+			TextSize = 11,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			TextTruncate = Enum.TextTruncate.AtEnd,
+			Text = where,
+			Parent = row
+		}, {TextColor3 = "Sub"})
+		if joinable then
+			local join = self:Make("TextButton", {
+				AnchorPoint = Vector2.new(1, 0.5),
+				Position = UDim2.new(1, -8, 0.5, 0),
+				Size = UDim2.fromOffset(58, 30),
+				BorderSizePixel = 0,
+				AutoButtonColor = false,
+				ClipsDescendants = true,
+				Font = Enum.Font.GothamMedium,
+				TextSize = 12,
+				Text = "Join",
+				Parent = row
+			}, {BackgroundColor3 = "Element", TextColor3 = "Text"})
+			Round(join, 6)
+			Hover(self, join)
+			self:Pressable(join)
+			join.MouseButton1Click:Connect(function()
+				self:Teleport(friend.PlaceId, friend.GameId, (friend.DisplayName or friend.UserName or "your friend") .. "'s server")
+			end)
+		end
+	end
+
+	local function ShowMore()
+		local limit = math.min(shown + 20, #friends)
+		for index = shown + 1, limit do
+			AddRow(friends[index], index)
+		end
+		shown = limit
+		moreButton.Visible = shown < #friends
+		moreButton.Text = "Show more (" .. (#friends - shown) .. " left)"
+	end
+	moreButton.MouseButton1Click:Connect(ShowMore)
+
+	local function Fetch()
+		empty.Visible = true
+		empty.Text = "Loading friends..."
+		task.spawn(function()
+			local ok, result = pcall(function()
+				return player:GetFriendsOnline(200)
+			end)
+			if self.Closed then
+				return
+			end
+			friends = {}
+			if ok and type(result) == "table" then
+				for _, item in ipairs(result) do
+					table.insert(friends, item)
+				end
+				table.sort(friends, function(a, b)
+					local left = type(a.GameId) == "string" and a.GameId ~= ""
+					local right = type(b.GameId) == "string" and b.GameId ~= ""
+					if left ~= right then
+						return left
+					end
+					return tostring(a.DisplayName) < tostring(b.DisplayName)
+				end)
+			end
+			for _, child in ipairs(friendList:GetChildren()) do
+				if child:GetAttribute("FriendRow") then
+					child:Destroy()
+				end
+			end
+			shown = 0
+			if not ok then
+				countLabel.Text = "Friends online: unavailable"
+				empty.Text = "The friends list is not available here"
+				empty.Visible = true
+				moreButton.Visible = false
+				return
+			end
+			countLabel.Text = "Friends online: " .. #friends
+			empty.Text = "No friends are online right now"
+			empty.Visible = #friends == 0
+			ShowMore()
+		end)
+	end
+
+	tab:CreateButton({
+		Name = "Refresh Friends",
+		Description = "Load the list of friends again",
+		Callback = function()
+			Fetch()
+		end
+	})
+
+	tab:CreateSection("Server Tools")
+	tab:CreateButton({
+		Name = "Join Busiest Server",
+		Description = "Join the server with the most players",
+		Callback = function()
+			self:JoinServer("Busiest")
+		end
+	})
+	tab:CreateButton({
+		Name = "Join Emptiest Server",
+		Description = "Join the server with the fewest players",
+		Callback = function()
+			self:JoinServer("Emptiest")
+		end
+	})
+	tab:CreateButton({
+		Name = "Join Random Server",
+		Description = "Hop to a random server",
+		Callback = function()
+			self:JoinServer("Random")
+		end
+	})
+
+	local named = false
+	entry.OnShow = function()
+		Fill()
+		ShowRecent(Record(nil))
+		if not ticking then
+			ticking = true
+			Tick()
+		end
+		if not fetched then
+			fetched = true
+			Fetch()
+		end
+		if not named then
+			named = true
+			gameName.Text = "Place " .. tostring(game.PlaceId)
+			task.spawn(function()
+				local ok, info = pcall(function()
+					return MarketplaceService:GetProductInfo(game.PlaceId)
+				end)
+				if self.Closed then
+					return
+				end
+				if ok and type(info) == "table" and info.Name then
+					gameName.Text = info.Name
+					ShowRecent(Record(info.Name))
+				end
+			end)
+		end
+	end
+end
+
+function Window:BuildTopTabs(config)
+	local menu = self:AddTopEntry("Menu", nil, nil)
+	self.MenuEntry = menu
+	menu.Active = true
+	menu.Render(0)
+	self.TopSelected = menu
+	if config.Guide ~= false then
+		self:BuildGuide(config)
+	end
+	if config.Profile ~= false then
+		self:BuildProfile(config)
+	end
+end
+
+function Window:ResetTab(tab)
+	tab = tab or self.LastContentTab or self.CurrentTab
+	if not tab or not tab.Controls then
+		return 0
+	end
+	local count = 0
+	self.Loading = true
+	for _, entry in ipairs(tab.Controls) do
+		local ok = pcall(function()
+			entry.object:Set(entry.default)
+		end)
+		if ok then
+			count = count + 1
+		end
+	end
+	self.Loading = false
+	return count
+end
+
+function Window:ResetAll()
+	local count = 0
+	for _, tab in ipairs(self.Tabs) do
+		if not tab.IsSettings then
+			count = count + self:ResetTab(tab)
+		end
+	end
+	for _, tab in ipairs(self.TopTabs) do
+		count = count + self:ResetTab(tab)
+	end
+	return count
+end
+
+function Window:SetAllGroups(open)
+	local count = 0
+	for _, group in ipairs(self.Groups) do
+		group.Set(open)
+		count = count + 1
+	end
+	return count
+end
+
+function Window:SetSidebar(visible)
+	self.SidebarVisible = visible
+	local width = visible and 124 or 0
+	if visible and not self.OnTop then
+		self.Side.Visible = true
+	end
+	Animate(self.Side, {Size = UDim2.new(0, width, 1, -TopHeight)}, 0.2)
+	local tween = Animate(self.Content, {
+		Position = UDim2.fromOffset(width, TopHeight),
+		Size = UDim2.new(1, -width, 1, -TopHeight)
+	}, 0.2)
+	tween.Completed:Connect(function()
+		if not self.SidebarVisible and not self.Closed then
+			self.Side.Visible = false
+		end
+	end)
+end
+
+function Window:SetFocusMode(state)
+	self.Focus = state == true
+	self:SetSidebar(not self.Focus)
+	if self.Grip then
+		self.Grip.Visible = not self.Locked and not self.Focus
+	end
+end
+
+function Window:RefreshUI()
+	self:RunHooks()
+	self:OnViewport()
+	if self.CurrentTab then
+		self:MoveIndicator(self.CurrentTab, true)
+	end
+	for _, control in ipairs(self.Dropdowns) do
+		control.Close()
+	end
+	self:Flash()
+end
+
+function Window:DescribeSettings()
+	local names = {}
+	for flag in pairs(self.Elements) do
+		table.insert(names, flag)
+	end
+	table.sort(names)
+	local lines = {}
+	for _, flag in ipairs(names) do
+		local ok, value = pcall(function()
+			return self.Elements[flag]:Get()
+		end)
+		if ok then
+			local kind = typeof(value)
+			local text
+			if kind == "Color3" then
+				text = "#" .. value:ToHex()
+			elseif kind == "EnumItem" then
+				text = value.Name
+			elseif type(value) == "table" then
+				text = "{" .. table.concat(value, ", ") .. "}"
+			else
+				text = tostring(value)
+			end
+			table.insert(lines, flag .. " = " .. text)
+		end
+	end
+	return table.concat(lines, "\n"), #lines
+end
+
+function Window:CopySettings()
+	local text, count = self:DescribeSettings()
+	if count == 0 then
+		return false, "No settings to copy yet. Give controls a Flag to include them"
+	end
+	if type(setclipboard) == "function" then
+		local ok = pcall(setclipboard, text)
+		if ok then
+			return true, count .. " settings copied"
+		end
+	end
+	self:Dialog({Title = "Current Settings", Content = string.sub(text, 1, 700), Buttons = {{Name = "Close"}}})
+	return true, "Settings are shown in the window"
+end
+
+function Window:ShowHelp()
+	self:Dialog({
+		Title = "Help",
+		Content = "Move: drag the top bar or the sidebar.\nResize: drag the bottom right corner.\nSliders: drag, type a value, or use - and +.\nButtons show OK or Failed after use.\nSettings has reset tools, Focus Mode, colors and config.",
+		Buttons = {{Name = "Close"}}
+	})
+end
+
+function Window:RestoreDefaults()
+	self:ResetColors()
+	self:ResetLayout()
+	self:SetOpacity(100)
+	self:SetLocked(false)
+	self:SetReduceMotion(false)
+	self:SetPerformance(false)
+	self:SetAutoPerformance(false)
+	self.PinchEnabled = false
+	self:SetFocusMode(false)
+	if self.OpacitySlider then
+		self.OpacitySlider:Set(100, true)
+	end
+	if self.PinchToggle then
+		self.PinchToggle:Set(false, true)
+	end
+	if self.AutoToggle then
+		self.AutoToggle:Set(false, true)
+	end
+	if self.FpsToggle then
+		self.FpsToggle:Set(false, true)
+	end
+	if self.Watermark then
+		self.Watermark:SetVisible(false)
+	end
 end
 
 function Window:CreateSettingsTab(name, icon)
 	local tab = self:CreateTab(name or "Settings", icon)
+	tab.IsSettings = true
+	self.SettingsTab = tab
 
 	tab:CreateSection("Quick Settings")
 	self.LockToggle = tab:CreateToggle({
@@ -2591,7 +4213,7 @@ function Window:CreateSettingsTab(name, icon)
 			self:SetPerformance(state)
 		end
 	})
-	tab:CreateToggle({
+	self.AutoToggle = tab:CreateToggle({
 		Name = "Auto Performance",
 		Description = "Turn on Performance Mode when FPS stays low",
 		Default = false,
@@ -2601,26 +4223,112 @@ function Window:CreateSettingsTab(name, icon)
 	})
 	tab:CreateButton({
 		Name = "Hide Menu",
+		Description = "Hide the menu. Press the + button to bring it back",
 		Callback = function()
 			self:SetHidden(true)
 		end
 	})
+
+	tab:CreateSection("Tools")
+	tab:CreateButton({
+		Name = "Reset Current Tab",
+		Description = "Restore the controls of the tab you were just using",
+		Callback = function()
+			local target = self.LastContentTab
+			if not target or #(target.Controls or {}) == 0 then
+				self:Status("Updated", "That tab has no controls to reset")
+				return
+			end
+			self:Confirm("Do you want to reset " .. target.Name .. " to its default values?", function()
+				local count = self:ResetTab(target)
+				self:Flash()
+				self:Status("Updated", count .. " controls reset in " .. target.Name)
+			end)
+		end
+	})
+	tab:CreateButton({
+		Name = "Reset All Controls",
+		Description = "Restore every control in every tab to its default value",
+		Callback = function()
+			self:Confirm("Do you want to reset all controls to their default values?", function()
+				local count = self:ResetAll()
+				self:Flash()
+				self:Status("Updated", count .. " controls were reset")
+			end)
+		end
+	})
+	tab:CreateButton({
+		Name = "Collapse All Groups",
+		Description = "Fold every group so the lists are shorter",
+		Callback = function()
+			local count = self:SetAllGroups(false)
+			self:Status("Updated", count > 0 and (count .. " groups collapsed") or "There are no groups yet")
+		end
+	})
+	tab:CreateButton({
+		Name = "Expand All Groups",
+		Description = "Open every group",
+		Callback = function()
+			local count = self:SetAllGroups(true)
+			self:Status("Updated", count > 0 and (count .. " groups expanded") or "There are no groups yet")
+		end
+	})
+	tab:CreateButton({
+		Name = "Show/Hide Sidebar",
+		Description = "Hide the tab list to get more room",
+		Callback = function()
+			self:SetSidebar(not self.SidebarVisible)
+		end
+	})
+	tab:CreateButton({
+		Name = "Focus Mode",
+		Description = "Show only the content. Press again to leave it",
+		Callback = function()
+			self:SetFocusMode(not self.Focus)
+		end
+	})
+	tab:CreateButton({
+		Name = "Refresh UI",
+		Description = "Redraw the menu without losing your values",
+		Callback = function()
+			self:RefreshUI()
+			self:Status("Updated", "Interface refreshed")
+		end
+	})
+	tab:CreateButton({
+		Name = "Copy Current Settings",
+		Description = "Copy your settings as text so you can keep them",
+		Callback = function()
+			local ok, detail = self:CopySettings()
+			self:Status(ok and "Saved" or "Error", detail)
+		end
+	})
+	tab:CreateButton({
+		Name = "Help",
+		Description = "Short guide to the menu controls",
+		Callback = function()
+			self:ShowHelp()
+		end
+	})
+	tab:CreateButton({
+		Name = "Restore Defaults",
+		Description = "Reset colors, layout and menu settings",
+		Danger = true,
+		Callback = function()
+			self:Confirm("Do you want to restore the default menu settings?", function()
+				self:RestoreDefaults()
+				self:Flash()
+				self:Status("Updated", "Default settings restored")
+			end)
+		end
+	})
 	tab:CreateButton({
 		Name = "Reset Layout",
+		Description = "Put the menu back to its first size and position",
 		Callback = function()
 			self:ResetLayout()
 			self:Flash()
 			self:Status("Updated", "Menu size and position were reset")
-		end
-	})
-	tab:CreateButton({
-		Name = "Reset Theme",
-		Callback = function()
-			self:Confirm("Do you want to reset all colors to default?", function()
-				self:ResetColors()
-				self:Flash()
-				self:Status("Updated", "Theme colors were reset")
-			end)
 		end
 	})
 
@@ -2663,6 +4371,17 @@ function Window:CreateSettingsTab(name, icon)
 			picker:Set(self.Theme.Accent, true)
 		end
 	})
+	tab:CreateButton({
+		Name = "Reset Theme",
+		Description = "Back to the black menu with white text",
+		Callback = function()
+			self:Confirm("Do you want to reset all colors to default?", function()
+				self:ResetColors()
+				self:Flash()
+				self:Status("Updated", "Theme colors were reset")
+			end)
+		end
+	})
 
 	tab:CreateSection("Window")
 	self.ZoomSlider = tab:CreateSlider({
@@ -2676,7 +4395,7 @@ function Window:CreateSettingsTab(name, icon)
 			self:SetScale(value / 100, true)
 		end
 	})
-	tab:CreateSlider({
+	self.OpacitySlider = tab:CreateSlider({
 		Name = "Menu Opacity",
 		Min = 40,
 		Max = 100,
@@ -2687,7 +4406,7 @@ function Window:CreateSettingsTab(name, icon)
 			self:SetOpacity(value)
 		end
 	})
-	tab:CreateToggle({
+	self.PinchToggle = tab:CreateToggle({
 		Name = "Pinch To Zoom",
 		Description = "Two fingers on the menu resize it",
 		Default = false,
@@ -2695,7 +4414,7 @@ function Window:CreateSettingsTab(name, icon)
 			self.PinchEnabled = state
 		end
 	})
-	tab:CreateToggle({
+	self.FpsToggle = tab:CreateToggle({
 		Name = "Show FPS And Ping",
 		Default = false,
 		Callback = function(state)
@@ -2727,6 +4446,7 @@ function Window:CreateSettingsTab(name, icon)
 	})
 	tab:CreateButton({
 		Name = "Save Config",
+		Description = "Keep your current control values",
 		Callback = function()
 			local ok, err = self:SaveConfig(configName)
 			if ok then
@@ -2739,6 +4459,7 @@ function Window:CreateSettingsTab(name, icon)
 	})
 	tab:CreateButton({
 		Name = "Load Config",
+		Description = "Bring back a saved set of values",
 		Callback = function()
 			local ok, err = self:LoadConfig(configName)
 			if ok then
@@ -2780,12 +4501,46 @@ function Window:CreateSettingsTab(name, icon)
 	tab:CreateSection("Menu")
 	tab:CreateButton({
 		Name = "Close Menu",
+		Danger = true,
 		Callback = function()
 			self:RequestClose()
 		end
 	})
 	return tab
 end
+
+function Graphite.load(first, second, third)
+	if first == Graphite then
+		first, second, third = second, third, nil
+	end
+	local config = {}
+	if type(first) == "table" then
+		for key, value in pairs(first) do
+			config[key] = value
+		end
+	elseif type(first) == "number" then
+		if type(second) == "number" and type(third) == "number" then
+			if first == 2 then
+				config.Min = second
+				config.Max = third
+			else
+				config.Time = second
+			end
+		elseif type(second) == "number" then
+			config.Min = first
+			config.Max = second
+		else
+			config.Time = first
+		end
+	end
+	if config.Time == nil and config.Min == nil and config.Seconds == nil then
+		config.Time = 5
+	end
+	PendingLoad = config
+	return config
+end
+
+Graphite.Load = Graphite.load
 
 function Graphite:CreateWindow(config)
 	config = config or {}
@@ -2822,6 +4577,15 @@ function Graphite:CreateWindow(config)
 	self.NoteList = {}
 	self.NoteOrder = 0
 	ActiveWindow = self
+	self.Groups = {}
+	self.SidebarVisible = true
+	self.Focus = false
+	self.TopEntries = {}
+	self.TopTabs = {}
+	self.CustomTop = 0
+	self.OnTop = false
+	self.Created = os.clock()
+	self.ConfirmTeleport = config.ConfirmTeleport ~= false
 	self.FileName = config.FileName or "Bio.Menu.txt"
 	local shared = GlobalEnv()
 	self.Source = config.Source or shared.GraphiteSourceText
@@ -2874,8 +4638,15 @@ function Graphite:CreateWindow(config)
 	Round(main, 10)
 	self.Main = main
 	self.UIScale = Create("UIScale", {Scale = self.TargetScale * 0.85, Parent = main})
-	Animate(self.UIScale, {Scale = self.TargetScale}, 0.35, Enum.EasingStyle.Back)
-	Animate(main, {GroupTransparency = 0}, 0.25)
+	local gate = PendingLoad
+	PendingLoad = nil
+	if gate then
+		self.Gated = true
+		main.Visible = false
+	else
+		Animate(self.UIScale, {Scale = self.TargetScale}, 0.35, Enum.EasingStyle.Back)
+		Animate(main, {GroupTransparency = 0}, 0.25)
+	end
 
 	local top = self:Make("Frame", {
 		Name = "Top",
@@ -2897,9 +4668,11 @@ function Graphite:CreateWindow(config)
 		})
 		titleOffset = 38
 	end
+	local titleWidth = math.min(TextService:GetTextSize(self.Name, 13, Enum.Font.GothamMedium, Vector2.new(400, 30)).X + 6, 170)
+	self.TitleOffset = titleOffset
 	self.TitleLabel = self:Make("TextLabel", {
 		Position = UDim2.fromOffset(titleOffset, 0),
-		Size = UDim2.new(1, -titleOffset - 90, 1, 0),
+		Size = UDim2.new(0, titleWidth, 1, 0),
 		BackgroundTransparency = 1,
 		Font = Enum.Font.GothamMedium,
 		TextSize = 13,
@@ -2940,6 +4713,30 @@ function Graphite:CreateWindow(config)
 		Position = UDim2.new(1, -(buttonWidth + 6), 0.5, 0)
 	})
 
+	local buttonsWidth = buttonWidth * 2 + 20
+	local stripX = titleOffset + titleWidth + 10
+	self.ButtonsWidth = buttonsWidth
+	local strip = Create("ScrollingFrame", {
+		Position = UDim2.fromOffset(stripX, 0),
+		Size = UDim2.new(1, -(stripX + buttonsWidth), 1, 0),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		ScrollBarThickness = 0,
+		ScrollingDirection = Enum.ScrollingDirection.X,
+		CanvasSize = UDim2.new(),
+		AutomaticCanvasSize = Enum.AutomaticSize.X,
+		Visible = false,
+		Parent = top
+	})
+	Create("UIListLayout", {
+		FillDirection = Enum.FillDirection.Horizontal,
+		Padding = UDim.new(0, 4),
+		SortOrder = Enum.SortOrder.LayoutOrder,
+		VerticalAlignment = Enum.VerticalAlignment.Center,
+		Parent = strip
+	})
+	self.Strip = strip
+
 	local side = self:Make("Frame", {
 		Position = UDim2.fromOffset(0, TopHeight),
 		Size = UDim2.new(0, 124, 1, -TopHeight),
@@ -2966,6 +4763,7 @@ function Graphite:CreateWindow(config)
 	Create("UIListLayout", {Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder, Parent = tabList})
 	Pad(tabList, 8, 8, 9, 8)
 	self.TabList = tabList
+	self.Side = side
 	self.TabIndicator = self:Make("Frame", {
 		Position = UDim2.fromOffset(0, 0),
 		Size = UDim2.fromOffset(3, 16),
@@ -2988,6 +4786,15 @@ function Graphite:CreateWindow(config)
 		Parent = main
 	})
 	self.Content = content
+
+	self.TopContent = Create("Frame", {
+		Position = UDim2.fromOffset(0, TopHeight),
+		Size = UDim2.new(1, 0, 1, -TopHeight),
+		BackgroundTransparency = 1,
+		ClipsDescendants = true,
+		Visible = false,
+		Parent = main
+	})
 
 	local edge = Create("Frame", {
 		Position = UDim2.fromOffset(1, 1),
@@ -3211,7 +5018,15 @@ function Graphite:CreateWindow(config)
 		self:OnViewport()
 	end)
 
+	self:BuildTopTabs(config)
+
+	if gate then
+		self:RunGate(gate)
+	end
+
 	return self
 end
+
+GlobalEnv().En = Graphite
 
 return Graphite
