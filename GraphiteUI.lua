@@ -194,6 +194,51 @@ local function Decode(value)
 	return value
 end
 
+local function GlobalEnv()
+	if type(getgenv) == "function" then
+		local ok, shared = pcall(getgenv)
+		if ok and type(shared) == "table" then
+			return shared
+		end
+	end
+	return _G
+end
+
+local function Serialize(value)
+	local kind = type(value)
+	if kind == "number" then
+		if value ~= value or value == math.huge or value == -math.huge then
+			return "0"
+		end
+		return string.format("%.10g", value)
+	elseif kind == "boolean" then
+		return tostring(value)
+	elseif kind == "string" then
+		return string.format("%q", value)
+	elseif kind == "table" then
+		local parts = {}
+		for index = 1, #value do
+			table.insert(parts, Serialize(value[index]))
+		end
+		for key, item in pairs(value) do
+			if type(key) == "string" then
+				table.insert(parts, "[" .. string.format("%q", key) .. "]=" .. Serialize(item))
+			end
+		end
+		return "{" .. table.concat(parts, ",") .. "}"
+	end
+	return "nil"
+end
+
+local function LongString(text)
+	local level = 3
+	while string.find(text, "]" .. string.rep("=", level) .. "]", 1, true) do
+		level = level + 1
+	end
+	local equals = string.rep("=", level)
+	return "[" .. equals .. "[\n" .. text .. "\n]" .. equals .. "]"
+end
+
 function Window:Connect(signal, callback)
 	local connection = signal:Connect(callback)
 	table.insert(self.Connections, connection)
@@ -1062,6 +1107,81 @@ function Window:LoadConfig(name)
 	return true
 end
 
+function Window:BuildScriptFile()
+	local data = {}
+	for flag, object in pairs(self.Elements) do
+		local ok, value = pcall(function()
+			return object:Get()
+		end)
+		if ok and value ~= nil then
+			data[flag] = Encode(value)
+		end
+	end
+	local lines = {
+		"do",
+		"local g = type(getgenv) == \"function\" and getgenv() or _G",
+		"g.GraphiteSaved = " .. Serialize(data)
+	}
+	local source = self.Source
+	if string.match(source, "^https?://%S+$") then
+		table.insert(lines, "end")
+		table.insert(lines, "loadstring(game:HttpGet(" .. string.format("%q", source) .. "))()")
+	else
+		table.insert(lines, "g.GraphiteSourceText = " .. LongString(source))
+		table.insert(lines, "end")
+		table.insert(lines, "loadstring((type(getgenv) == \"function\" and getgenv() or _G).GraphiteSourceText)()")
+	end
+	return table.concat(lines, "\n") .. "\n"
+end
+
+function Window:SaveScriptFile()
+	if type(writefile) ~= "function" then
+		return false, "Files are only available in an executor"
+	end
+	if type(self.Source) ~= "string" or self.Source == "" then
+		return false, "No script source is set. Use the all-in-one script or pass Source to CreateWindow"
+	end
+	local ok, err = pcall(function()
+		writefile(self.FileName, self:BuildScriptFile())
+	end)
+	if ok then
+		self.Dirty = false
+	end
+	return ok, err
+end
+
+function Window:RunScriptFile()
+	if type(readfile) ~= "function" or type(isfile) ~= "function" then
+		return false, "Files are only available in an executor"
+	end
+	if not isfile(self.FileName) then
+		return false, self.FileName .. " was not found. Press Create File first"
+	end
+	if type(loadstring) ~= "function" then
+		return false, "This executor cannot run scripts"
+	end
+	local read, content = pcall(readfile, self.FileName)
+	if not read or type(content) ~= "string" or content == "" then
+		return false, "The saved file could not be read"
+	end
+	local chunk = loadstring(content)
+	if type(chunk) ~= "function" then
+		return false, "The saved file is damaged"
+	end
+	task.spawn(function()
+		local passed, problem = pcall(chunk)
+		if passed then
+			self:Destroy()
+		else
+			warn("[Graphite] " .. tostring(problem))
+			if not self.Closed then
+				self:Status("Error", "The saved file failed to run")
+			end
+		end
+	end)
+	return true
+end
+
 function Window:SelectTab(tab)
 	local previous = self.CurrentTab
 	for _, other in ipairs(self.Tabs) do
@@ -1271,6 +1391,14 @@ end
 local function Register(win, flag, object)
 	if flag then
 		win.Elements[flag] = object
+		local saved = win.Pending and win.Pending[flag]
+		if saved ~= nil then
+			win.Loading = true
+			pcall(function()
+				object:Set(Decode(saved))
+			end)
+			win.Loading = false
+		end
 	end
 end
 
@@ -2176,12 +2304,11 @@ function Tab:CreateDropdown(config)
 	function object:Get()
 		return multi and Collect() or single
 	end
-	Register(win, config.Flag, object)
-
 	Build()
 	if config.Default ~= nil then
 		object:Set(config.Default, true)
 	end
+	Register(win, config.Flag, object)
 
 	header.MouseButton1Click:Connect(function()
 		if not open then
@@ -2623,6 +2750,33 @@ function Window:CreateSettingsTab(name, icon)
 		end
 	})
 
+	tab:CreateSection("Script File")
+	tab:CreateButton({
+		Name = "Create File",
+		Description = "Saves " .. self.FileName .. " in the executor folder",
+		Callback = function()
+			local ok, err = self:SaveScriptFile()
+			if ok then
+				self:Flash()
+				self:Status("Saved", self.FileName)
+			else
+				self:Status("Error", tostring(err))
+			end
+		end
+	})
+	tab:CreateButton({
+		Name = "Run Saved File",
+		Description = "Runs " .. self.FileName .. " and restores your settings",
+		Callback = function()
+			self:Confirm("Do you want to run the saved file? The current menu will be replaced.", function()
+				local ok, err = self:RunScriptFile()
+				if not ok then
+					self:Status("Error", tostring(err))
+				end
+			end)
+		end
+	})
+
 	tab:CreateSection("Menu")
 	tab:CreateButton({
 		Name = "Close Menu",
@@ -2668,6 +2822,16 @@ function Graphite:CreateWindow(config)
 	self.NoteList = {}
 	self.NoteOrder = 0
 	ActiveWindow = self
+	self.FileName = config.FileName or "Bio.Menu.txt"
+	local shared = GlobalEnv()
+	self.Source = config.Source or shared.GraphiteSourceText
+	if type(shared.GraphiteSaved) == "table" then
+		self.Pending = shared.GraphiteSaved
+		shared.GraphiteSaved = nil
+		task.delay(10, function()
+			self.Pending = nil
+		end)
+	end
 
 	local gui = Create("ScreenGui", {
 		Name = "Graphite" .. math.random(1000, 9999),
