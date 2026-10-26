@@ -6,6 +6,7 @@ local CoreGui = game:GetService("CoreGui")
 local Workspace = game:GetService("Workspace")
 local HttpService = game:GetService("HttpService")
 local Stats = game:GetService("Stats")
+local TextService = game:GetService("TextService")
 
 local LocalPlayer = Players.LocalPlayer
 local Touch = UserInputService.TouchEnabled
@@ -25,6 +26,10 @@ local function C(r, g, b)
 end
 
 local DefaultBase = C(40, 40, 43)
+
+local Motion = {Reduce = false, Performance = false}
+local ActiveWindow
+local ErrorLog = {message = nil, time = 0}
 
 local NoteColors = {
 	Success = C(80, 200, 120),
@@ -94,11 +99,23 @@ local function Pad(parent, left, top, right, bottom)
 end
 
 local function Animate(inst, props, time, style, direction)
+	local duration = time or 0.15
+	if Motion.Reduce then
+		duration = 0
+	elseif Motion.Performance then
+		duration = duration * 0.5
+	end
 	local tween = TweenService:Create(
 		inst,
-		TweenInfo.new(time or 0.15, style or Enum.EasingStyle.Quad, direction or Enum.EasingDirection.Out),
+		TweenInfo.new(duration, style or Enum.EasingStyle.Quad, direction or Enum.EasingDirection.Out),
 		props
 	)
+	tween:Play()
+	return tween
+end
+
+local function Linear(inst, props, time)
+	local tween = TweenService:Create(inst, TweenInfo.new(time, Enum.EasingStyle.Linear), props)
 	tween:Play()
 	return tween
 end
@@ -118,9 +135,32 @@ local function IsPointer(input)
 end
 
 local function Fire(callback, ...)
-	if type(callback) == "function" then
-		task.spawn(callback, ...)
+	if type(callback) ~= "function" then
+		return
 	end
+	task.spawn(function(...)
+		local ok, err = pcall(callback, ...)
+		if ok then
+			return
+		end
+		warn("[Graphite] " .. tostring(err))
+		local window = ActiveWindow
+		if not window or window.Closed then
+			return
+		end
+		local message = string.match(tostring(err), "[^\n]+") or "Unknown error"
+		message = string.gsub(message, "^.-:%d+:%s*", "")
+		if #message > 90 then
+			message = string.sub(message, 1, 90) .. "..."
+		end
+		local now = os.clock()
+		if ErrorLog.message == message and now - ErrorLog.time < 3 then
+			return
+		end
+		ErrorLog.message = message
+		ErrorLog.time = now
+		window:Notify({Title = "Error", Content = message, Type = "Error", Duration = 5})
+	end, ...)
 end
 
 local function ViewSize(gui)
@@ -263,6 +303,203 @@ function Window:Slide(hit, onMove, scroller, onBegin, onEnd)
 			onEnd()
 		end
 	end)
+end
+
+function Window:Fancy()
+	return not Motion.Reduce and not Motion.Performance and self.TargetScale >= 0.6
+end
+
+function Window:IsFresh()
+	return os.clock() - self.Born < 1.5
+end
+
+function Window:Status(kind, detail)
+	local presets = {
+		Saved = {"Saved", "Success"},
+		Loaded = {"Loaded", "Success"},
+		Updated = {"Updated", "Info"},
+		Error = {"Error", "Error"},
+		Unsaved = {"Unsaved Changes", "Warning"}
+	}
+	local preset = presets[kind] or {tostring(kind), "Info"}
+	self:Notify({
+		Title = preset[1],
+		Content = detail,
+		Type = preset[2],
+		Duration = kind == "Unsaved" and 2.5 or 3
+	})
+end
+
+function Window:Touch(flag)
+	if not flag or self.Loading or self.Dirty or self.Closed then
+		return
+	end
+	self.Dirty = true
+	self:Status("Unsaved", "Use Save Config to keep your changes")
+end
+
+function Window:SetLocked(state)
+	self.Locked = state == true
+	if self.Grip then
+		self.Grip.Visible = not self.Locked
+	end
+	if self.LockToggle then
+		self.LockToggle:Set(self.Locked, true)
+	end
+end
+
+function Window:SetReduceMotion(state)
+	Motion.Reduce = state == true
+	if self.ReduceToggle then
+		self.ReduceToggle:Set(Motion.Reduce, true)
+	end
+end
+
+function Window:SetPerformance(state)
+	Motion.Performance = state == true
+	if self.PerformanceToggle then
+		self.PerformanceToggle:Set(Motion.Performance, true)
+	end
+end
+
+function Window:SetAutoPerformance(state)
+	if self.PerfConnection then
+		self.PerfConnection:Disconnect()
+		self.PerfConnection = nil
+	end
+	if not state then
+		return
+	end
+	local frames = 0
+	local last = os.clock()
+	local low = 0
+	self.PerfConnection = RunService.RenderStepped:Connect(function()
+		frames = frames + 1
+		local now = os.clock()
+		if now - last >= 1 then
+			local fps = frames / (now - last)
+			frames = 0
+			last = now
+			if fps < 24 then
+				low = low + 1
+			else
+				low = 0
+			end
+			if low >= 3 and not Motion.Performance then
+				self:SetPerformance(true)
+				self:Status("Updated", "Performance Mode turned on because FPS is low")
+			end
+		end
+	end)
+	table.insert(self.Connections, self.PerfConnection)
+end
+
+function Window:Flash()
+	local stroke = self.EdgeStroke
+	if not stroke then
+		return
+	end
+	local tween = Animate(stroke, {Color = self.Theme.Accent, Thickness = 3}, 0.14)
+	tween.Completed:Connect(function()
+		Animate(stroke, {Color = self.Theme.Stroke, Thickness = 1}, 0.4)
+	end)
+end
+
+function Window:Ripple(button, input)
+	if not self:Fancy() then
+		return
+	end
+	local count = button:GetAttribute("Ripples") or 0
+	if count >= 3 then
+		return
+	end
+	button:SetAttribute("Ripples", count + 1)
+	local factor = button:IsDescendantOf(self.Main) and self.UIScale.Scale or 1
+	factor = math.max(factor, 0.01)
+	local origin = button.AbsolutePosition
+	local size = button.AbsoluteSize
+	local x = (input.Position.X - origin.X) / factor
+	local y = (input.Position.Y - origin.Y) / factor
+	local reach = math.max(size.X, size.Y) / factor * 1.7
+	local dot = Create("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromOffset(x, y),
+		Size = UDim2.fromOffset(0, 0),
+		BackgroundColor3 = self.Theme.Accent,
+		BackgroundTransparency = 0.75,
+		BorderSizePixel = 0,
+		ZIndex = 0,
+		Parent = button
+	})
+	Create("UICorner", {CornerRadius = UDim.new(1, 0), Parent = dot})
+	local tween = Animate(dot, {Size = UDim2.fromOffset(reach, reach), BackgroundTransparency = 1}, 0.45)
+	tween.Completed:Connect(function()
+		dot:Destroy()
+		button:SetAttribute("Ripples", math.max((button:GetAttribute("Ripples") or 1) - 1, 0))
+	end)
+end
+
+function Window:Pressable(button, over)
+	button.InputBegan:Connect(function(input)
+		if IsPointer(input) then
+			self:Ripple(button, input)
+			Animate(button, {BackgroundColor3 = self.Theme.Stroke}, 0.06)
+		end
+	end)
+	button.InputEnded:Connect(function(input)
+		if IsPointer(input) then
+			Animate(button, {BackgroundColor3 = self.Theme[over or "Hover"]}, 0.14)
+		end
+	end)
+end
+
+function Window:Reveal(object, delay)
+	if not self:Fancy() or object.BackgroundTransparency >= 1 then
+		return
+	end
+	local goal = object:GetAttribute("Goal")
+	if goal == nil then
+		goal = object.BackgroundTransparency
+		object:SetAttribute("Goal", goal)
+	end
+	object.BackgroundTransparency = 1
+	task.delay(delay, function()
+		if object.Parent and not self.Closed then
+			Animate(object, {BackgroundTransparency = goal}, 0.2)
+		end
+	end)
+end
+
+function Window:Stagger(page)
+	if not self:Fancy() then
+		return
+	end
+	local count = 0
+	for _, child in ipairs(page:GetChildren()) do
+		if child:IsA("GuiObject") then
+			count = count + 1
+			if count > 10 then
+				break
+			end
+			self:Reveal(child, count * 0.025)
+		end
+	end
+end
+
+function Window:MoveIndicator(tab, instant)
+	local indicator = self.TabIndicator
+	if not indicator or not tab then
+		return
+	end
+	local height = Touch and 36 or 30
+	local y = 8 + (tab.Index - 1) * (height + 4) + height / 2 - 8 - self.TabList.CanvasPosition.Y
+	local goal = UDim2.fromOffset(0, y)
+	indicator.Visible = true
+	if instant then
+		indicator.Position = goal
+	else
+		Animate(indicator, {Position = goal}, 0.22, Enum.EasingStyle.Back)
+	end
 end
 
 function Window:Rebuild()
@@ -522,7 +759,9 @@ function Window:Dialog(config)
 			Parent = row
 		}, {BackgroundColor3 = "Element", TextColor3 = "Text"})
 		Round(button, 6)
+		button.ClipsDescendants = true
 		Hover(self, button)
+		self:Pressable(button)
 		button.MouseButton1Click:Connect(function()
 			self:CloseDialog()
 			Fire(spec.Callback)
@@ -551,6 +790,9 @@ function Window:Destroy()
 		return
 	end
 	self.Closed = true
+	if ActiveWindow == self then
+		ActiveWindow = nil
+	end
 	for _, connection in ipairs(self.Connections) do
 		connection:Disconnect()
 	end
@@ -567,37 +809,91 @@ end
 
 function Window:Notify(config)
 	config = config or {}
+	if self.Closed then
+		return
+	end
 	local theme = self.Theme
+	local kind = config.Type
+	local color = NoteColors[kind] or theme.Accent
+	local glyphs = {Success = "OK", Warning = "!", Error = "x"}
+	local glyph = glyphs[kind] or "i"
+	local duration = config.Duration or 4
+
+	while #self.NoteList >= 4 do
+		local oldest = table.remove(self.NoteList, 1)
+		if oldest and oldest.Parent then
+			oldest:Destroy()
+		end
+	end
+
+	self.NoteOrder = self.NoteOrder + 1
 	local holder = Create("Frame", {
+		LayoutOrder = self.NoteOrder,
 		Size = UDim2.fromOffset(250, 0),
 		AutomaticSize = Enum.AutomaticSize.Y,
 		BackgroundTransparency = 1,
 		Parent = self.Notes
 	})
-	local card = Create("Frame", {
+	table.insert(self.NoteList, holder)
+	holder.Destroying:Connect(function()
+		local index = table.find(self.NoteList, holder)
+		if index then
+			table.remove(self.NoteList, index)
+		end
+	end)
+
+	local card = Create("CanvasGroup", {
 		Position = UDim2.fromOffset(280, 0),
 		Size = UDim2.new(1, 0, 0, 0),
 		AutomaticSize = Enum.AutomaticSize.Y,
 		BackgroundColor3 = theme.Top,
 		BorderSizePixel = 0,
+		GroupTransparency = 1,
 		Parent = holder
 	})
 	Round(card, 8)
-	Create("UIStroke", {Color = theme.Stroke, Thickness = 1, ApplyStrokeMode = Enum.ApplyStrokeMode.Border, Parent = card})
-	local bar = Create("Frame", {
-		Size = UDim2.new(0, 3, 1, 0),
-		BackgroundColor3 = NoteColors[config.Type] or theme.Accent,
+
+	local edge = Create("Frame", {
+		Position = UDim2.fromOffset(1, 1),
+		Size = UDim2.new(1, -2, 1, -2),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		ZIndex = 4,
+		Parent = card
+	})
+	Round(edge, 7)
+	Create("UIStroke", {
+		Color = theme.Stroke,
+		Thickness = 1,
+		ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+		Parent = edge
+	})
+
+	local icon = Create("Frame", {
+		Position = UDim2.fromOffset(12, 10),
+		Size = UDim2.fromOffset(20, 20),
+		BackgroundColor3 = color,
 		BorderSizePixel = 0,
 		Parent = card
 	})
-	Round(bar, 2)
+	Round(icon, 10)
+	Create("TextLabel", {
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.GothamBold,
+		TextSize = 10,
+		TextColor3 = Luma(color) > 0.55 and Color3.fromRGB(20, 20, 20) or Color3.new(1, 1, 1),
+		Text = glyph,
+		Parent = icon
+	})
+
 	local body = Create("Frame", {
 		Size = UDim2.new(1, 0, 0, 0),
 		AutomaticSize = Enum.AutomaticSize.Y,
 		BackgroundTransparency = 1,
 		Parent = card
 	})
-	Pad(body, 14, 9, 12, 9)
+	Pad(body, 42, 9, 12, 12)
 	Create("UIListLayout", {Padding = UDim.new(0, 2), SortOrder = Enum.SortOrder.LayoutOrder, Parent = body})
 	Create("TextLabel", {
 		LayoutOrder = 1,
@@ -627,14 +923,40 @@ function Window:Notify(config)
 			Parent = body
 		})
 	end
-	Animate(card, {Position = UDim2.fromOffset(0, 0)}, 0.3, Enum.EasingStyle.Back)
-	task.delay(config.Duration or 4, function()
-		if card.Parent then
-			local tween = Animate(card, {Position = UDim2.fromOffset(280, 0)}, 0.25)
-			tween.Completed:Wait()
-			holder:Destroy()
+
+	local bar = Create("Frame", {
+		AnchorPoint = Vector2.new(0, 1),
+		Position = UDim2.fromScale(0, 1),
+		Size = UDim2.new(1, 0, 0, 2),
+		BackgroundColor3 = color,
+		BorderSizePixel = 0,
+		ZIndex = 3,
+		Parent = card
+	})
+
+	local dismissed = false
+	local function Dismiss()
+		if dismissed then
+			return
 		end
-	end)
+		dismissed = true
+		local tween = Animate(card, {Position = UDim2.fromOffset(280, 0), GroupTransparency = 1}, 0.25)
+		tween.Completed:Connect(function()
+			holder:Destroy()
+		end)
+	end
+
+	local tap = Create("TextButton", {
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		Text = "",
+		ZIndex = 5,
+		Parent = card
+	})
+	tap.MouseButton1Click:Connect(Dismiss)
+
+	Animate(card, {Position = UDim2.fromOffset(0, 0), GroupTransparency = 0}, 0.3, Enum.EasingStyle.Back)
+	Linear(bar, {Size = UDim2.new(0, 0, 0, 2)}, duration).Completed:Connect(Dismiss)
 end
 
 function Window:CreateWatermark(config)
@@ -706,6 +1028,9 @@ function Window:SaveConfig(name)
 	local ok, err = pcall(function()
 		writefile(self.Folder .. "/" .. name .. ".json", HttpService:JSONEncode(data))
 	end)
+	if ok then
+		self.Dirty = false
+	end
 	return ok, err
 end
 
@@ -720,15 +1045,20 @@ function Window:LoadConfig(name)
 	local ok, data = pcall(function()
 		return HttpService:JSONDecode(readfile(path))
 	end)
-	if not ok then
-		return false, data
+	if not ok or type(data) ~= "table" then
+		return false, (not ok) and tostring(data) or "Config is damaged"
 	end
+	self.Loading = true
 	for flag, raw in pairs(data) do
 		local object = self.Elements[flag]
 		if object then
-			object:Set(Decode(raw))
+			pcall(function()
+				object:Set(Decode(raw))
+			end)
 		end
 	end
+	self.Loading = false
+	self.Dirty = false
 	return true
 end
 
@@ -737,12 +1067,19 @@ function Window:SelectTab(tab)
 	for _, other in ipairs(self.Tabs) do
 		other.Active = other == tab
 		other.Page.Visible = other.Active
-		other.Render(0.12)
+		other.Render(0.14)
 	end
 	self.CurrentTab = tab
-	if previous ~= tab then
+	self:MoveIndicator(tab, previous == nil)
+	if previous ~= tab and self:Fancy() then
+		if tab.PageTween then
+			tab.PageTween:Cancel()
+		end
 		tab.Page.Position = UDim2.fromOffset(0, 14)
-		Animate(tab.Page, {Position = UDim2.fromOffset(0, 0)}, 0.2)
+		tab.PageTween = Animate(tab.Page, {Position = UDim2.fromOffset(0, 0)}, 0.2)
+		self:Stagger(tab.Page)
+	elseif previous ~= tab then
+		tab.Page.Position = UDim2.fromOffset(0, 0)
 	end
 end
 
@@ -752,26 +1089,18 @@ function Window:CreateTab(name, icon)
 	tab.Name = name or "Tab"
 	tab.Order = 0
 	tab.Active = false
+	tab.Index = #self.Tabs + 1
 
-	local button = self:Make("TextButton", {
+	local button = Create("TextButton", {
 		Name = tab.Name,
 		Size = UDim2.new(1, 0, 0, Touch and 36 or 30),
 		BackgroundTransparency = 1,
 		AutoButtonColor = false,
 		Text = "",
-		LayoutOrder = #self.Tabs + 1,
+		LayoutOrder = tab.Index,
 		Parent = self.TabList
-	}, {BackgroundColor3 = "Element"})
+	})
 	Round(button, 6)
-
-	local indicator = self:Make("Frame", {
-		Position = UDim2.new(0, 0, 0.5, -8),
-		Size = UDim2.fromOffset(3, 16),
-		BorderSizePixel = 0,
-		Visible = false,
-		Parent = button
-	}, {BackgroundColor3 = "Accent"})
-	Round(indicator, 2)
 
 	local textOffset = 12
 	local iconLabel
@@ -820,17 +1149,34 @@ function Window:CreateTab(name, icon)
 
 	function tab.Render(time)
 		local theme = self.Theme
-		Animate(button, {BackgroundTransparency = tab.Active and 0 or 1}, time)
+		Animate(button, {
+			BackgroundTransparency = tab.Active and 0 or 1,
+			BackgroundColor3 = tab.Active and theme.Hover or theme.Element
+		}, time)
 		Animate(label, {TextColor3 = tab.Active and theme.Text or theme.Sub}, time)
 		if iconLabel then
 			Animate(iconLabel, {ImageColor3 = tab.Active and theme.Text or theme.Sub}, time)
 		end
-		indicator.Visible = tab.Active
 	end
 
 	self:Bind(function()
 		tab.Render(0)
 	end)
+
+	if self:Fancy() and self:IsFresh() then
+		label.TextTransparency = 1
+		if iconLabel then
+			iconLabel.ImageTransparency = 1
+		end
+		task.delay(0.1 + tab.Index * 0.05, function()
+			if label.Parent then
+				Animate(label, {TextTransparency = 0}, 0.25)
+				if iconLabel then
+					Animate(iconLabel, {ImageTransparency = 0}, 0.25)
+				end
+			end
+		end)
+	end
 
 	button.MouseEnter:Connect(function()
 		if not tab.Active then
@@ -864,9 +1210,14 @@ local function NewRow(tab, height, class)
 	if class == "TextButton" then
 		row.Text = ""
 		row.AutoButtonColor = false
+		row.ClipsDescendants = true
 	end
 	Round(row, 6)
 	tab.Window:Stroke(row, "Stroke", 0.6)
+	local win = tab.Window
+	if win:IsFresh() and tab.Page.Visible then
+		win:Reveal(row, math.min(tab.Order, 10) * 0.03)
+	end
 	return row
 end
 
@@ -941,12 +1292,14 @@ function Tab:CreateGroup(config)
 		Size = UDim2.new(1, 0, 0, RowHeight - 4),
 		BorderSizePixel = 0,
 		AutoButtonColor = false,
+		ClipsDescendants = true,
 		Text = "",
 		Parent = holder
 	}, {BackgroundColor3 = "Element"})
 	Round(header, 6)
 	win:Stroke(header, "Stroke", 0.6)
 	Hover(win, header)
+	win:Pressable(header)
 	local title = win:Make("TextLabel", {
 		Position = UDim2.fromOffset(12, 0),
 		Size = UDim2.new(1, -44, 1, 0),
@@ -969,23 +1322,78 @@ function Tab:CreateGroup(config)
 		Parent = header
 	}, {TextColor3 = "Sub"})
 
-	local body = Create("Frame", {
+	local clip = Create("Frame", {
 		LayoutOrder = 1,
 		Size = UDim2.new(1, 0, 0, 0),
 		AutomaticSize = Enum.AutomaticSize.Y,
 		BackgroundTransparency = 1,
+		ClipsDescendants = true,
 		Parent = holder
+	})
+	local body = Create("Frame", {
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1,
+		Parent = clip
 	})
 	Create("UIListLayout", {Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder, Parent = body})
 	Pad(body, 8, 0, 0, 0)
 
 	local open = config.Open ~= false
-	body.Visible = open
+	local height = 0
+	local token = 0
 	mark.Text = open and "-" or "+"
-	header.MouseButton1Click:Connect(function()
-		open = not open
-		body.Visible = open
+	clip.Visible = open
+
+	local function Measure()
+		return body.AbsoluteSize.Y / math.max(win.UIScale.Scale, 0.01)
+	end
+
+	local function Apply(state, animate)
+		open = state
 		mark.Text = open and "-" or "+"
+		token = token + 1
+		local current = token
+		local moving = animate and win:Fancy()
+		if moving then
+			mark.Rotation = -90
+			Animate(mark, {Rotation = 0}, 0.2)
+		end
+		if open then
+			clip.Visible = true
+			if moving and height > 1 then
+				clip.AutomaticSize = Enum.AutomaticSize.None
+				clip.Size = UDim2.new(1, 0, 0, 0)
+				local tween = Animate(clip, {Size = UDim2.new(1, 0, 0, height)}, 0.22)
+				tween.Completed:Connect(function()
+					if token == current and open then
+						clip.AutomaticSize = Enum.AutomaticSize.Y
+						clip.Size = UDim2.new(1, 0, 0, 0)
+					end
+				end)
+			else
+				clip.AutomaticSize = Enum.AutomaticSize.Y
+				clip.Size = UDim2.new(1, 0, 0, 0)
+			end
+		else
+			height = math.max(Measure(), height)
+			if moving and height > 1 then
+				clip.AutomaticSize = Enum.AutomaticSize.None
+				clip.Size = UDim2.new(1, 0, 0, height)
+				local tween = Animate(clip, {Size = UDim2.new(1, 0, 0, 0)}, 0.2)
+				tween.Completed:Connect(function()
+					if token == current and not open then
+						clip.Visible = false
+					end
+				end)
+			else
+				clip.Visible = false
+			end
+		end
+	end
+
+	header.MouseButton1Click:Connect(function()
+		Apply(not open, true)
 	end)
 
 	local group = setmetatable({}, Tab)
@@ -998,17 +1406,34 @@ function Tab:CreateGroup(config)
 end
 
 function Tab:CreateSection(text)
+	local win = self.Window
 	self.Order = self.Order + 1
-	return self.Window:Make("TextLabel", {
+	local caption = string.upper(text or "Section")
+	local width = TextService:GetTextSize(caption, 11, Enum.Font.GothamBold, Vector2.new(1000, 22)).X
+	local holder = Create("Frame", {
 		Size = UDim2.new(1, 0, 0, 22),
+		BackgroundTransparency = 1,
+		LayoutOrder = self.Order,
+		Parent = self.Page
+	})
+	local label = win:Make("TextLabel", {
+		Size = UDim2.fromOffset(width + 2, 22),
 		BackgroundTransparency = 1,
 		Font = Enum.Font.GothamBold,
 		TextSize = 11,
 		TextXAlignment = Enum.TextXAlignment.Left,
-		Text = string.upper(text or "Section"),
-		LayoutOrder = self.Order,
-		Parent = self.Page
+		Text = caption,
+		Parent = holder
 	}, {TextColor3 = "Sub"})
+	win:Make("Frame", {
+		AnchorPoint = Vector2.new(0, 0.5),
+		Position = UDim2.new(0, width + 12, 0.5, 1),
+		Size = UDim2.new(1, -(width + 12), 0, 1),
+		BackgroundTransparency = 0.45,
+		BorderSizePixel = 0,
+		Parent = holder
+	}, {BackgroundColor3 = "Stroke"})
+	return label
 end
 
 function Tab:CreateDivider()
@@ -1186,9 +1611,8 @@ function Tab:CreateButton(config)
 	local row = NewRow(self, config.Description and (RowHeight + 14) or RowHeight, "TextButton")
 	local label = RowLabel(win, row, config.Name or "Button", 24, config.Icon, config.Description, config.KeepIconColor)
 	Hover(win, row)
+	win:Pressable(row)
 	row.MouseButton1Click:Connect(function()
-		row.BackgroundColor3 = win.Theme.Accent
-		Animate(row, {BackgroundColor3 = win.Theme.Element}, 0.3)
 		Fire(config.Callback)
 	end)
 	local object = {}
@@ -1205,6 +1629,7 @@ function Tab:CreateToggle(config)
 	local row = NewRow(self, config.Description and (RowHeight + 14) or RowHeight, "TextButton")
 	RowLabel(win, row, config.Name or "Toggle", 70, config.Icon, config.Description, config.KeepIconColor)
 	Hover(win, row)
+	win:Pressable(row)
 
 	local track = Create("Frame", {
 		AnchorPoint = Vector2.new(1, 0.5),
@@ -1229,15 +1654,46 @@ function Tab:CreateToggle(config)
 		Animate(knob, {Position = state and UDim2.new(1, -19, 0.5, 0) or UDim2.new(0, 3, 0.5, 0)}, time, Enum.EasingStyle.Back)
 	end
 
+	local function Pulse()
+		if not win:Fancy() then
+			return
+		end
+		local ring = Create("Frame", {
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.new(1, -11, 0.5, 0),
+			Size = UDim2.fromOffset(16, 16),
+			BackgroundTransparency = 1,
+			BorderSizePixel = 0,
+			ZIndex = 0,
+			Parent = track
+		})
+		Create("UICorner", {CornerRadius = UDim.new(1, 0), Parent = ring})
+		local stroke = Create("UIStroke", {Color = win.Theme.Accent, Thickness = 2, Transparency = 0.2, Parent = ring})
+		Animate(ring, {Size = UDim2.fromOffset(36, 36)}, 0.4)
+		local tween = Animate(stroke, {Transparency = 1}, 0.4)
+		tween.Completed:Connect(function()
+			ring:Destroy()
+		end)
+	end
+
 	win:Bind(function()
 		Render(0)
 	end)
 
 	local object = {}
 	function object:Set(value, silent)
+		local was = state
 		state = value == true
 		Render(0.18)
+		if state and not was and not silent then
+			Pulse()
+		end
 		if not silent then
+			win:Touch(config.Flag)
+			if state and config.Important and win:Fancy() then
+				row.BackgroundColor3 = win.Theme.Accent
+				Animate(row, {BackgroundColor3 = win.Theme.Element}, 0.5)
+			end
 			Fire(config.Callback, state)
 		end
 	end
@@ -1300,6 +1756,8 @@ function Tab:CreateSlider(config)
 		Rotation = 90,
 		Parent = fill
 	})
+	local glow = Create("UIStroke", {Thickness = 0, Transparency = 0.55, Parent = fill})
+	win:Paint(glow, "Color", "Accent")
 	local knob = Create("Frame", {
 		AnchorPoint = Vector2.new(0.5, 0.5),
 		Position = UDim2.fromScale(0, 0.5),
@@ -1326,10 +1784,16 @@ function Tab:CreateSlider(config)
 		newValue = tonumber(string.format("%.4f", newValue))
 		value = math.clamp(newValue, min, max)
 		local alpha = max == min and 0 or (value - min) / (max - min)
-		fill.Size = UDim2.fromScale(alpha, 1)
-		knob.Position = UDim2.fromScale(alpha, 0.5)
+		if not silent and win:Fancy() then
+			Animate(fill, {Size = UDim2.fromScale(alpha, 1)}, 0.08)
+			Animate(knob, {Position = UDim2.fromScale(alpha, 0.5)}, 0.08)
+		else
+			fill.Size = UDim2.fromScale(alpha, 1)
+			knob.Position = UDim2.fromScale(alpha, 0.5)
+		end
 		box.Text = tostring(value) .. suffix
 		if not silent then
+			win:Touch(config.Flag)
 			Fire(config.Callback, value)
 		end
 	end
@@ -1355,8 +1819,12 @@ function Tab:CreateSlider(config)
 		local alpha = math.clamp((position.X - track.AbsolutePosition.X) / track.AbsoluteSize.X, 0, 1)
 		object:Set(min + (max - min) * alpha)
 	end, self.Scroller, function()
-		Animate(knob, {Size = UDim2.fromOffset(22, 22)}, 0.12, Enum.EasingStyle.Back)
+		if win:Fancy() then
+			Animate(glow, {Thickness = 4}, 0.15)
+		end
+		Animate(knob, {Size = UDim2.fromOffset(21, 21)}, 0.12, Enum.EasingStyle.Back)
 	end, function()
+		Animate(glow, {Thickness = 0}, 0.2)
 		Animate(knob, {Size = UDim2.fromOffset(18, 18)}, 0.12)
 	end)
 	return object
@@ -1424,13 +1892,20 @@ function Tab:CreateInput(config)
 	}, {BackgroundColor3 = "Top", TextColor3 = "Text", PlaceholderColor3 = "Sub"})
 	Round(box, 5)
 	win:Stroke(box)
+	local last = box.Text
 	box.FocusLost:Connect(function(enter)
+		if box.Text ~= last then
+			last = box.Text
+			win:Touch(config.Flag)
+		end
 		Fire(config.Callback, box.Text, enter)
 	end)
 	local object = {}
 	function object:Set(value, silent)
 		box.Text = tostring(value)
+		last = box.Text
 		if not silent then
+			win:Touch(config.Flag)
 			Fire(config.Callback, box.Text, true)
 		end
 	end
@@ -1477,6 +1952,7 @@ function Tab:CreateKeybind(config)
 				listening = false
 				key = input.KeyCode == Enum.KeyCode.Escape and Enum.KeyCode.Unknown or input.KeyCode
 				Render()
+				win:Touch(config.Flag)
 				Fire(config.Changed, key)
 			end
 			return
@@ -1508,6 +1984,7 @@ function Tab:CreateDropdown(config)
 	local chosen = {}
 	local open = false
 	local buttons = {}
+	local marks = {}
 	local optionHeight = RowHeight - 10
 
 	local row = NewRow(self, RowHeight)
@@ -1561,7 +2038,34 @@ function Tab:CreateDropdown(config)
 		list.Size = UDim2.new(1, -16, 0, ListHeight())
 		Animate(row, {Size = UDim2.new(1, 0, 0, open and (RowHeight + 4 + ListHeight() + 8) or RowHeight)}, 0.2)
 		mark.Text = open and "-" or "+"
+		if open and win:Fancy() then
+			local index = 0
+			for _, option in ipairs(options) do
+				local button = buttons[option]
+				if button then
+					index = index + 1
+					if index > 8 then
+						break
+					end
+					button.TextTransparency = 1
+					task.delay(index * 0.02, function()
+						if button.Parent then
+							Animate(button, {TextTransparency = 0}, 0.15)
+						end
+					end)
+				end
+			end
+		end
 	end
+
+	local control = {}
+	function control.Close()
+		if open then
+			open = false
+			Resize()
+		end
+	end
+	table.insert(win.Dropdowns, control)
 
 	local function Collect()
 		local names = {}
@@ -1579,6 +2083,11 @@ function Tab:CreateDropdown(config)
 			button.TextColor3 = active and win.Theme.Accent or win.Theme.Text
 			button.BackgroundColor3 = win.Theme.Hover
 			button.BackgroundTransparency = active and 0.35 or 1
+			local tick = marks[option]
+			if tick then
+				tick.Visible = active and true or false
+				tick.BackgroundColor3 = win.Theme.Accent
+			end
 		end
 		if multi then
 			local names = Collect()
@@ -1595,6 +2104,7 @@ function Tab:CreateDropdown(config)
 	local function Commit(silent)
 		Render()
 		if not silent then
+			win:Touch(config.Flag)
 			Fire(config.Callback, multi and Collect() or single)
 		end
 	end
@@ -1604,6 +2114,7 @@ function Tab:CreateDropdown(config)
 			button:Destroy()
 		end
 		buttons = {}
+		marks = {}
 		for index, option in ipairs(options) do
 			local button = Create("TextButton", {
 				LayoutOrder = index,
@@ -1612,10 +2123,22 @@ function Tab:CreateDropdown(config)
 				AutoButtonColor = false,
 				Font = Enum.Font.Gotham,
 				TextSize = 12,
+				TextXAlignment = Enum.TextXAlignment.Left,
 				Text = tostring(option),
 				Parent = list
 			})
 			Round(button, 5)
+			Pad(button, 14, 0, 6, 0)
+			local tick = Create("Frame", {
+				AnchorPoint = Vector2.new(0, 0.5),
+				Position = UDim2.new(0, -9, 0.5, 0),
+				Size = UDim2.fromOffset(3, 14),
+				BorderSizePixel = 0,
+				Visible = false,
+				Parent = button
+			})
+			Round(tick, 2)
+			marks[option] = tick
 			button.MouseButton1Click:Connect(function()
 				if multi then
 					chosen[option] = not chosen[option] or nil
@@ -1661,6 +2184,13 @@ function Tab:CreateDropdown(config)
 	end
 
 	header.MouseButton1Click:Connect(function()
+		if not open then
+			for _, other in ipairs(win.Dropdowns) do
+				if other ~= control then
+					other.Close()
+				end
+			end
+		end
 		open = not open
 		Resize()
 	end)
@@ -1839,6 +2369,7 @@ function Tab:CreateColorPicker(config)
 		channels[2].Text = tostring(math.floor(color.G * 255 + 0.5))
 		channels[3].Text = tostring(math.floor(color.B * 255 + 0.5))
 		if not silent then
+			win:Touch(config.Flag)
 			Fire(config.Callback, color)
 		end
 	end
@@ -1908,6 +2439,64 @@ end
 function Window:CreateSettingsTab(name, icon)
 	local tab = self:CreateTab(name or "Settings", icon)
 
+	tab:CreateSection("Quick Settings")
+	self.LockToggle = tab:CreateToggle({
+		Name = "Lock Menu",
+		Description = "Lock the position and size of the menu",
+		Default = self.Locked,
+		Callback = function(state)
+			self:SetLocked(state)
+		end
+	})
+	self.ReduceToggle = tab:CreateToggle({
+		Name = "Reduce Motion",
+		Description = "Turn off most animations",
+		Default = Motion.Reduce,
+		Callback = function(state)
+			self:SetReduceMotion(state)
+		end
+	})
+	self.PerformanceToggle = tab:CreateToggle({
+		Name = "Performance Mode",
+		Description = "Use lighter effects for better FPS",
+		Default = Motion.Performance,
+		Callback = function(state)
+			self:SetPerformance(state)
+		end
+	})
+	tab:CreateToggle({
+		Name = "Auto Performance",
+		Description = "Turn on Performance Mode when FPS stays low",
+		Default = false,
+		Callback = function(state)
+			self:SetAutoPerformance(state)
+		end
+	})
+	tab:CreateButton({
+		Name = "Hide Menu",
+		Callback = function()
+			self:SetHidden(true)
+		end
+	})
+	tab:CreateButton({
+		Name = "Reset Layout",
+		Callback = function()
+			self:ResetLayout()
+			self:Flash()
+			self:Status("Updated", "Menu size and position were reset")
+		end
+	})
+	tab:CreateButton({
+		Name = "Reset Theme",
+		Callback = function()
+			self:Confirm("Do you want to reset all colors to default?", function()
+				self:ResetColors()
+				self:Flash()
+				self:Status("Updated", "Theme colors were reset")
+			end)
+		end
+	})
+
 	tab:CreateSection("Colors")
 	self.MenuPicker = tab:CreateColorPicker({
 		Name = "Menu Color",
@@ -1945,14 +2534,6 @@ function Window:CreateSettingsTab(name, icon)
 			self.AccentColor = nil
 			self:Rebuild()
 			picker:Set(self.Theme.Accent, true)
-		end
-	})
-	tab:CreateButton({
-		Name = "Reset All Colors",
-		Callback = function()
-			self:Confirm("Do you want to reset all colors to default?", function()
-				self:ResetColors()
-			end)
 		end
 	})
 
@@ -2021,32 +2602,28 @@ function Window:CreateSettingsTab(name, icon)
 		Name = "Save Config",
 		Callback = function()
 			local ok, err = self:SaveConfig(configName)
-			self:Notify({
-				Title = ok and "Config saved" or "Save failed",
-				Content = ok and configName or tostring(err),
-				Type = ok and "Success" or "Error"
-			})
+			if ok then
+				self:Flash()
+				self:Status("Saved", configName)
+			else
+				self:Status("Error", tostring(err))
+			end
 		end
 	})
 	tab:CreateButton({
 		Name = "Load Config",
 		Callback = function()
 			local ok, err = self:LoadConfig(configName)
-			self:Notify({
-				Title = ok and "Config loaded" or "Load failed",
-				Content = ok and configName or tostring(err),
-				Type = ok and "Success" or "Error"
-			})
+			if ok then
+				self:Flash()
+				self:Status("Loaded", configName)
+			else
+				self:Status("Error", tostring(err))
+			end
 		end
 	})
 
 	tab:CreateSection("Menu")
-	tab:CreateButton({
-		Name = "Reset Size And Position",
-		Callback = function()
-			self:ResetLayout()
-		end
-	})
 	tab:CreateButton({
 		Name = "Close Menu",
 		Callback = function()
@@ -2083,6 +2660,14 @@ function Graphite:CreateWindow(config)
 	self.TextColor = config.TextColor
 	self.AccentColor = config.AccentColor or config.Accent
 	self.Theme = BuildTheme(self.Base, self.TextColor, self.AccentColor)
+	self.Born = os.clock()
+	self.Locked = false
+	self.Dirty = false
+	self.Loading = false
+	self.Dropdowns = {}
+	self.NoteList = {}
+	self.NoteOrder = 0
+	ActiveWindow = self
 
 	local gui = Create("ScreenGui", {
 		Name = "Graphite" .. math.random(1000, 9999),
@@ -2195,6 +2780,7 @@ function Graphite:CreateWindow(config)
 		Position = UDim2.fromOffset(0, TopHeight),
 		Size = UDim2.new(0, 124, 1, -TopHeight),
 		BorderSizePixel = 0,
+		ClipsDescendants = true,
 		Parent = main
 	}, {BackgroundColor3 = "Side"})
 	self:Make("Frame", {
@@ -2216,6 +2802,19 @@ function Graphite:CreateWindow(config)
 	Create("UIListLayout", {Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder, Parent = tabList})
 	Pad(tabList, 8, 8, 9, 8)
 	self.TabList = tabList
+	self.TabIndicator = self:Make("Frame", {
+		Position = UDim2.fromOffset(0, 0),
+		Size = UDim2.fromOffset(3, 16),
+		BorderSizePixel = 0,
+		Visible = false,
+		Parent = side
+	}, {BackgroundColor3 = "Accent"})
+	Round(self.TabIndicator, 2)
+	self:Connect(tabList:GetPropertyChangedSignal("CanvasPosition"), function()
+		if self.CurrentTab then
+			self:MoveIndicator(self.CurrentTab, true)
+		end
+	end)
 
 	local content = Create("Frame", {
 		Position = UDim2.fromOffset(124, TopHeight),
@@ -2235,7 +2834,7 @@ function Graphite:CreateWindow(config)
 		Parent = main
 	})
 	Round(edge, 9)
-	self:Stroke(edge)
+	self.EdgeStroke = self:Stroke(edge)
 
 	local gripSize = Touch and 30 or 20
 	local grip = Create("TextButton", {
@@ -2259,14 +2858,22 @@ function Graphite:CreateWindow(config)
 		Round(dot, 2)
 	end
 
+	self.Grip = grip
 	local resizeOrigin
 	local resizeStart
 	local resizeCorner
 	self:Pointer(grip, function(input)
+		if self.Locked then
+			resizeOrigin = nil
+			return
+		end
 		resizeOrigin = input.Position
 		resizeStart = Vector2.new(main.Size.X.Offset, main.Size.Y.Offset)
 		resizeCorner = main.AbsolutePosition
 	end, function(input)
+		if not resizeOrigin then
+			return
+		end
 		local scale = self.UIScale.Scale
 		local delta = (input.Position - resizeOrigin) / scale
 		local width = math.clamp(resizeStart.X + delta.X, self.MinSize.X, self.MaxSize.X)
@@ -2278,20 +2885,31 @@ function Graphite:CreateWindow(config)
 			(resizeCorner.Y + height * scale / 2) / current.Y
 		)
 		self:Clamp()
+	end, function()
+		resizeOrigin = nil
 	end)
 
 	local function AttachDrag(handle)
 		local origin
 		local startCenter
 		self:Pointer(handle, function(input)
+			if self.Locked then
+				origin = nil
+				return
+			end
 			local current = ViewSize(gui)
 			origin = input.Position
 			startCenter = Vector2.new(main.Position.X.Scale * current.X, main.Position.Y.Scale * current.Y)
 		end, function(input)
+			if not origin then
+				return
+			end
 			local current = ViewSize(gui)
 			local delta = input.Position - origin
 			main.Position = UDim2.fromScale((startCenter.X + delta.X) / current.X, (startCenter.Y + delta.Y) / current.Y)
 			self:Clamp()
+		end, function()
+			origin = nil
 		end)
 	end
 	AttachDrag(top)
