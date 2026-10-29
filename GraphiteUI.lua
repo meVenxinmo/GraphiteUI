@@ -2020,7 +2020,7 @@ function Window:RequestClose()
 	end)
 end
 
-function Window:Destroy()
+function Window:Destroy(immediate)
 	if self.Closed then
 		return
 	end
@@ -2036,12 +2036,16 @@ function Window:Destroy()
 	end
 	self.Restore.Visible = false
 	self:CloseDialog()
-	Animate(self.UIScale, {Scale = self.UIScale.Scale * 0.85}, 0.2)
-	Animate(self.Main, {GroupTransparency = 1}, 0.2)
 	local gui = self.Gui
-	task.delay(0.3, function()
+	if immediate then
 		gui:Destroy()
-	end)
+	else
+		Animate(self.UIScale, {Scale = self.UIScale.Scale * 0.85}, 0.2)
+		Animate(self.Main, {GroupTransparency = 1}, 0.2)
+		task.delay(0.3, function()
+			gui:Destroy()
+		end)
+	end
 	Fire(self.OnClose)
 end
 
@@ -5413,6 +5417,9 @@ Graphite.Icons = Icons
 
 function Graphite:CreateWindow(config)
 	config = config or {}
+	if config.ReplaceExisting ~= false and ActiveWindow and not ActiveWindow.Closed then
+		ActiveWindow:Destroy(true)
+	end
 	local self = setmetatable({}, Window)
 	self.Name = config.Name or "Graphite"
 	self.Flags = {}
@@ -5457,7 +5464,7 @@ function Graphite:CreateWindow(config)
 	self.Created = os.clock()
 	self.ConfirmTeleport = config.ConfirmTeleport ~= false
 	self.BorderThickness = 1
-	self.Depth = 7
+	self.Depth = config.Depth or 7
 	self.TiltMax = 12
 	self.FollowMode = "Character"
 	self.Mode3D = false
