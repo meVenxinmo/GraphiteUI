@@ -15,6 +15,21 @@ local Touch = UserInputService.TouchEnabled
 local RowHeight = Touch and 40 or 36
 local TopHeight = Touch and 40 or 34
 
+local function CanHover()
+	return UserInputService.MouseEnabled
+end
+
+local FooterHeight = 44
+local Icons = {
+	Close = "rbxassetid://12953907125",
+	File = "rbxassetid://11570895459",
+	Gear = "rbxassetid://103052477976081",
+	List = "rbxassetid://96541223"
+}
+local Canvas3D = Vector2.new(580, 400)
+local BarCanvas = Vector2.new(360, 80)
+local LogoImage = "rbxassetid://104226806827804"
+
 local Graphite = {Version = "1.1"}
 
 local Window = {}
@@ -51,7 +66,7 @@ local function Shift(color, amount)
 	return color:Lerp(Color3.new(0, 0, 0), -amount)
 end
 
-local function BuildTheme(base, text, accent)
+local function BuildTheme(base, text, accent, border)
 	local dark = Luma(base) < 0.5
 	local theme = {Main = base}
 	if dark then
@@ -70,6 +85,7 @@ local function BuildTheme(base, text, accent)
 	theme.Text = text or (dark and C(255, 255, 255) or C(28, 28, 32))
 	theme.Sub = theme.Text:Lerp(base, 0.42)
 	theme.Accent = accent or (dark and Shift(base, 0.6) or Shift(base, -0.55))
+	theme.Border = border or (dark and Shift(base, 0.5) or Shift(base, -0.38))
 	return theme
 end
 
@@ -343,7 +359,9 @@ end
 
 local function Hover(win, inst, base, over)
 	inst.MouseEnter:Connect(function()
-		Animate(inst, {BackgroundColor3 = win.Theme[over or "Hover"]}, 0.1)
+		if CanHover() then
+			Animate(inst, {BackgroundColor3 = win.Theme[over or "Hover"]}, 0.1)
+		end
 	end)
 	inst.MouseLeave:Connect(function()
 		Animate(inst, {BackgroundColor3 = win.Theme[base or "Element"]}, 0.1)
@@ -396,9 +414,9 @@ function Window:Slide(hit, onMove, scroller, onBegin, onEnd)
 		if onBegin then
 			onBegin()
 		end
-		onMove(input.Position)
+		onMove(self:Cursor(input.Position))
 	end, function(input)
-		onMove(input.Position)
+		onMove(self:Cursor(input.Position))
 	end, function()
 		if scroller then
 			scroller.ScrollingEnabled = true
@@ -503,9 +521,9 @@ function Window:Flash()
 	if not stroke then
 		return
 	end
-	local tween = Animate(stroke, {Color = self.Theme.Accent, Thickness = 3}, 0.14)
+	local tween = Animate(stroke, {Color = self.Theme.Accent, Thickness = math.max(3, self.BorderThickness + 2)}, 0.14)
 	tween.Completed:Connect(function()
-		Animate(stroke, {Color = self.Theme.Stroke, Thickness = 1}, 0.4)
+		Animate(stroke, {Color = self.Theme.Border, Thickness = self.BorderThickness}, 0.4)
 	end)
 end
 
@@ -522,8 +540,14 @@ function Window:Ripple(button, input)
 	factor = math.max(factor, 0.01)
 	local origin = button.AbsolutePosition
 	local size = button.AbsoluteSize
-	local x = (input.Position.X - origin.X) / factor
-	local y = (input.Position.Y - origin.Y) / factor
+	local part, canvas
+	if self.Mode3D and self.BarSurface and button:IsDescendantOf(self.BarSurface) then
+		part = self.BarPart
+		canvas = BarCanvas
+	end
+	local point = self:Cursor(input.Position, part, canvas)
+	local x = (point.X - origin.X) / factor
+	local y = (point.Y - origin.Y) / factor
 	local reach = math.max(size.X, size.Y) / factor * 1.7
 	local dot = Create("Frame", {
 		AnchorPoint = Vector2.new(0.5, 0.5),
@@ -543,16 +567,49 @@ function Window:Ripple(button, input)
 	end)
 end
 
-function Window:Pressable(button, over)
+function Window:Pressable(button, base)
+	base = base or "Element"
+	local function Rest(touch)
+		Animate(button, {BackgroundColor3 = self.Theme[touch and base or "Hover"]}, 0.14)
+	end
 	button.InputBegan:Connect(function(input)
-		if IsPointer(input) then
+		if not IsPointer(input) then
+			return
+		end
+		if input.UserInputType == Enum.UserInputType.Touch then
+			local press = {input = input, origin = input.Position, button = button, base = base}
+			self.TouchPress = press
+			task.delay(0.12, function()
+				if self.TouchPress == press and not self.Closed then
+					press.applied = true
+					self:Ripple(button, input)
+					Animate(button, {BackgroundColor3 = self.Theme.Stroke}, 0.06)
+				end
+			end)
+		else
 			self:Ripple(button, input)
 			Animate(button, {BackgroundColor3 = self.Theme.Stroke}, 0.06)
 		end
 	end)
 	button.InputEnded:Connect(function(input)
-		if IsPointer(input) then
-			Animate(button, {BackgroundColor3 = self.Theme[over or "Hover"]}, 0.14)
+		if not IsPointer(input) then
+			return
+		end
+		if input.UserInputType == Enum.UserInputType.Touch then
+			local press = self.TouchPress
+			if press and press.input == input then
+				self.TouchPress = nil
+				if press.applied then
+					Rest(true)
+				else
+					local tween = Animate(button, {BackgroundColor3 = self.Theme.Stroke}, 0.05)
+					tween.Completed:Connect(function()
+						Rest(true)
+					end)
+				end
+			end
+		else
+			Rest(false)
 		end
 	end)
 end
@@ -606,11 +663,569 @@ function Window:MoveIndicator(tab, instant)
 	end
 end
 
+function Window:SetFileName(name)
+	name = tostring(name or "")
+	name = string.gsub(name, "[\\/:*?\"<>|%c]", "")
+	name = string.gsub(name, "^[%s%.]+", "")
+	name = string.gsub(name, "%s+$", "")
+	if name == "" then
+		name = "Bio.Menu.txt"
+	end
+	if not string.find(name, "%.%w+$") then
+		name = name .. ".txt"
+	end
+	if #name > 60 then
+		name = string.sub(name, 1, 56) .. ".txt"
+	end
+	self.FileName = name
+	return name
+end
+
+function Window:SetBorderThickness(value)
+	value = math.clamp(math.floor(value + 0.5), 1, 6)
+	self.BorderThickness = value
+	if self.Edge then
+		self.Edge.Position = UDim2.fromOffset(value, value)
+		self.Edge.Size = UDim2.new(1, -2 * value, 1, -2 * value)
+	end
+	if self.EdgeStroke then
+		self.EdgeStroke.Thickness = value
+	end
+end
+
+function Window:Cursor(position, part, canvas)
+	local x = position.X
+	local y = position.Y
+	part = part or self.Part
+	canvas = canvas or Canvas3D
+	if not self.Mode3D or not part then
+		return Vector2.new(x, y)
+	end
+	local camera = Workspace.CurrentCamera
+	if not camera then
+		return Vector2.new(x, y)
+	end
+	local ray = camera:ScreenPointToRay(x, y)
+	local normal = part.CFrame.LookVector
+	local denominator = ray.Direction:Dot(normal)
+	if math.abs(denominator) < 0.0001 then
+		return Vector2.new(-100000, -100000), -1, -1
+	end
+	local distance = (part.Position - ray.Origin):Dot(normal) / denominator
+	local hit = ray.Origin + ray.Direction * distance
+	local point = part.CFrame:PointToObjectSpace(hit)
+	local size = part.Size
+	local u = 0.5 - point.X / size.X
+	local v = 0.5 - point.Y / size.Y
+	return Vector2.new(u * canvas.X, v * canvas.Y), u, v
+end
+
+function Window:Tween3D(field, goal, duration, style, direction, done)
+	if self.FlyLink then
+		self.FlyLink:Disconnect()
+		self.FlyLink = nil
+	end
+	local old = self.FlyTween
+	self.FlyTween = nil
+	if old then
+		old:Cancel()
+	end
+	local holder = Create("NumberValue", {Value = self[field]})
+	local link = holder:GetPropertyChangedSignal("Value"):Connect(function()
+		self[field] = holder.Value
+	end)
+	self.FlyLink = link
+	local tween = Animate(holder, {Value = goal}, duration, style, direction)
+	self.FlyTween = tween
+	tween.Completed:Connect(function(playback)
+		if playback and playback ~= Enum.PlaybackState.Completed then
+			return
+		end
+		if self.FlyTween ~= tween then
+			return
+		end
+		link:Disconnect()
+		self.FlyLink = nil
+		self.FlyTween = nil
+		self[field] = goal
+		holder:Destroy()
+		if done then
+			done()
+		end
+	end)
+end
+
+function Window:ShowBar3D(show)
+	if not show then
+		self.Restore.Visible = false
+		return
+	end
+	if not self.BarPart then
+		local part = Create("Part", {
+			Name = "Graphite3DBar" .. math.random(1000, 9999),
+			Anchored = true,
+			CanCollide = false,
+			CanQuery = false,
+			CanTouch = false,
+			Transparency = 1,
+			Size = Vector3.new(BarCanvas.X / 100, BarCanvas.Y / 100, 0.05),
+			CFrame = self.Part.CFrame,
+			Parent = Workspace
+		})
+		local surface = Create("SurfaceGui", {
+			Name = "Graphite3DBarGui",
+			Face = Enum.NormalId.Front,
+			AlwaysOnTop = true,
+			LightInfluence = 0,
+			ResetOnSpawn = false,
+			SizingMode = Enum.SurfaceGuiSizingMode.FixedSize,
+			CanvasSize = BarCanvas,
+			Active = true,
+			Adornee = part
+		})
+		surface.Parent = self.Surface.Parent
+		self.BarPart = part
+		self.BarSurface = surface
+		self.RestoreSaved = {Anchor = self.Restore.AnchorPoint, Position = self.Restore.Position}
+		self.Restore.Parent = surface
+		self.Restore.AnchorPoint = Vector2.new(0.5, 0.5)
+		self.Restore.Position = UDim2.fromScale(0.5, 0.5)
+	end
+	self.Restore.Visible = true
+	self.RestoreScale.Scale = 0.6
+	Animate(self.RestoreScale, {Scale = 1}, 0.28, Enum.EasingStyle.Back)
+	if self.Place3D then
+		self.Place3D(1)
+	end
+end
+
+function Window:Fly3D(hide)
+	local token = self.Token
+	if hide then
+		self:Tween3D("Fly", 1, 0.6, Enum.EasingStyle.Quad, Enum.EasingDirection.In, function()
+			if self.Token == token and self.Hidden and self.Mode3D then
+				self.Main.Visible = false
+				self:ShowBar3D(true)
+			end
+		end)
+	else
+		self:ShowBar3D(false)
+		self:EnsureLogo()
+		self.Main.Visible = true
+		self.Main.GroupTransparency = self.Fade
+		self.UIScale.Scale = self.TargetScale
+		self:Tween3D("Fly", 0, 0.75, Enum.EasingStyle.Back, Enum.EasingDirection.Out, nil)
+	end
+end
+
+function Window:DropIn()
+	local main = self.Main
+	local goal = main.Position
+	local view = ViewSize(self.Gui)
+	local height = main.Size.Y.Offset * self.TargetScale
+	local fall = goal.Y.Scale * view.Y + height / 2 + 24
+	local function At(offset)
+		return UDim2.new(goal.X.Scale, goal.X.Offset, goal.Y.Scale, goal.Y.Offset + offset)
+	end
+	main.Visible = true
+	main.GroupTransparency = self.Fade
+	self.UIScale.Scale = self.TargetScale
+	main.Position = At(-fall)
+	local function Step(offset, time, direction, nextStep)
+		local tween = Animate(main, {Position = At(offset)}, time, Enum.EasingStyle.Quad, direction)
+		if nextStep then
+			tween.Completed:Connect(nextStep)
+		end
+	end
+	Step(0, 0.38, Enum.EasingDirection.In, function()
+		Step(-fall * 0.14, 0.15, Enum.EasingDirection.Out, function()
+			Step(0, 0.15, Enum.EasingDirection.In, function()
+				Step(-fall * 0.05, 0.1, Enum.EasingDirection.Out, function()
+					Step(0, 0.1, Enum.EasingDirection.In, function()
+						self:Clamp()
+					end)
+				end)
+			end)
+		end)
+	end)
+end
+
+function Window:Start3D()
+	self.Links3D = {}
+	local function Link(signal, handler)
+		local connection = signal:Connect(handler)
+		table.insert(self.Connections, connection)
+		table.insert(self.Links3D, connection)
+	end
+
+	local function Place(blend)
+		local camera = Workspace.CurrentCamera
+		local part = self.Part
+		if not camera or not part then
+			return
+		end
+		local cameraPosition = camera.CFrame.Position
+		local look = camera.CFrame.LookVector
+		local base
+		local character = LocalPlayer and LocalPlayer.Character
+		local root = character and character:FindFirstChild("HumanoidRootPart")
+		if self.FollowMode == "Character" and root then
+			local forward = root.CFrame.LookVector
+			forward = Vector3.new(forward.X, 0, forward.Z)
+			if forward.Magnitude < 0.01 then
+				forward = Vector3.new(0, 0, -1)
+			else
+				forward = forward.Unit
+			end
+			base = root.Position + forward * self.Depth + Vector3.new(0, 1.5, 0)
+		else
+			base = cameraPosition + look * self.Depth
+		end
+		local anchor = base + Vector3.new(0, self.Fly * 70, 0) + look * (self.Away * 90)
+		local tilt = self.Tilt
+		tilt.x = tilt.x + (tilt.tx - tilt.x) * blend
+		tilt.y = tilt.y + (tilt.ty - tilt.y) * blend
+		local target = CFrame.lookAt(anchor, cameraPosition) * CFrame.Angles(math.rad(tilt.x), math.rad(tilt.y), 0)
+		if blend >= 1 then
+			part.CFrame = target
+		else
+			part.CFrame = part.CFrame:Lerp(target, blend)
+		end
+		local bar = self.BarPart
+		if bar then
+			local barTarget = CFrame.lookAt(base + Vector3.new(0, 2.6, 0), cameraPosition)
+			if blend >= 1 then
+				bar.CFrame = barTarget
+			else
+				bar.CFrame = bar.CFrame:Lerp(barTarget, blend)
+			end
+		end
+	end
+	self.Place3D = Place
+	Place(1)
+
+	Link(RunService.RenderStepped, function(delta)
+		if self.Closed or not self.Mode3D then
+			return
+		end
+		if self.FlyTween then
+			Place(1)
+		else
+			Place(math.min(1, (delta or 0.016) * 12))
+		end
+	end)
+
+	local active
+	local function Apply(position)
+		local _, u, v = self:Cursor(position)
+		if u and u >= 0 and u <= 1 and v >= 0 and v <= 1 then
+			self.Tilt.ty = (u - 0.5) * 2 * self.TiltMax
+			self.Tilt.tx = (0.5 - v) * 2 * self.TiltMax * 0.8
+			return true
+		end
+		return false
+	end
+	Link(UserInputService.InputBegan, function(input)
+		if not self.Hidden and IsPointer(input) and Apply(input.Position) then
+			active = input
+		end
+	end)
+	Link(UserInputService.InputChanged, function(input)
+		if not active then
+			return
+		end
+		local match
+		if active.UserInputType == Enum.UserInputType.Touch then
+			match = input == active
+		else
+			match = input.UserInputType == Enum.UserInputType.MouseMovement
+		end
+		if match then
+			Apply(input.Position)
+		end
+	end)
+	Link(UserInputService.InputEnded, function(input)
+		if active and input == active then
+			active = nil
+			self.Tilt.tx = 0
+			self.Tilt.ty = 0
+		end
+	end)
+end
+
+function Window:Stop3D()
+	self.Mode3D = false
+	self.Leaving = false
+	if self.FlyLink then
+		self.FlyLink:Disconnect()
+		self.FlyLink = nil
+	end
+	local old = self.FlyTween
+	self.FlyTween = nil
+	if old then
+		old:Cancel()
+	end
+	self.Fly = 0
+	self.Away = 0
+	for _, connection in ipairs(self.Links3D or {}) do
+		connection:Disconnect()
+	end
+	self.Links3D = nil
+	self.Place3D = nil
+	if self.BarPart then
+		self.Restore.Parent = self.Gui
+		local saved = self.RestoreSaved
+		if saved then
+			self.Restore.AnchorPoint = saved.Anchor
+			self.Restore.Position = saved.Position
+		end
+		self.RestoreSaved = nil
+		self.BarSurface:Destroy()
+		self.BarPart:Destroy()
+		self.BarSurface = nil
+		self.BarPart = nil
+		self.Restore.Visible = self.Hidden
+		self:ClampRestore()
+	end
+	local saved = self.Saved2D
+	self.Main.Parent = self.Gui
+	self.Main.AnchorPoint = Vector2.new(0.5, 0.5)
+	if saved then
+		self.Main.Size = saved.Size
+		self.Main.Position = saved.Position
+		self.TargetScale = saved.Scale
+		if not self.Hidden then
+			self.UIScale.Scale = saved.Scale
+		end
+	end
+	self.Saved2D = nil
+	if self.Surface then
+		self.Surface:Destroy()
+	end
+	if self.Part then
+		self.Part:Destroy()
+	end
+	self.Surface = nil
+	self.Part = nil
+	self.Exit3D.Visible = false
+	self.Tilt.tx = 0
+	self.Tilt.ty = 0
+	self.Tilt.x = 0
+	self.Tilt.y = 0
+	self:Clamp()
+end
+
+function Window:SetMode3D(state)
+	state = state == true
+	if state == self.Mode3D then
+		return true
+	end
+	if not state then
+		if self.Leaving then
+			return true
+		end
+		if self.Closed or self.Hidden then
+			self:Stop3D()
+			return true
+		end
+		self.Leaving = true
+		self:CloseDialog()
+		self:Tween3D("Away", 1, 0.8, Enum.EasingStyle.Quad, Enum.EasingDirection.In, function()
+			if self.Closed or not self.Mode3D then
+				return
+			end
+			self:Stop3D()
+			self:DropIn()
+		end)
+		return true
+	end
+	if self.Leaving then
+		return false, "Wait for the menu to finish moving"
+	end
+	local camera = Workspace.CurrentCamera
+	if not camera then
+		return false, "The camera is not ready yet"
+	end
+	if self.Gated then
+		return false, "Wait until the menu has finished loading"
+	end
+	local part = Create("Part", {
+		Name = "Graphite3D" .. math.random(1000, 9999),
+		Anchored = true,
+		CanCollide = false,
+		CanQuery = false,
+		CanTouch = false,
+		Transparency = 1,
+		Size = Vector3.new(Canvas3D.X / 100, Canvas3D.Y / 100, 0.05),
+		CFrame = camera.CFrame * CFrame.new(0, 0, -self.Depth),
+		Parent = Workspace
+	})
+	local surface = Create("SurfaceGui", {
+		Name = "Graphite3DGui",
+		Face = Enum.NormalId.Front,
+		AlwaysOnTop = true,
+		LightInfluence = 0,
+		ResetOnSpawn = false,
+		SizingMode = Enum.SurfaceGuiSizingMode.FixedSize,
+		CanvasSize = Canvas3D,
+		Active = true,
+		Adornee = part
+	})
+	local placed = false
+	if LocalPlayer then
+		placed = pcall(function()
+			surface.Parent = LocalPlayer:WaitForChild("PlayerGui", 3)
+		end) and surface.Parent ~= nil
+	end
+	if not placed then
+		pcall(function()
+			surface.Parent = self.Gui.Parent
+		end)
+	end
+	if not surface.Parent then
+		part:Destroy()
+		surface:Destroy()
+		return false, "The 3D menu could not be created here"
+	end
+	local main = self.Main
+	self.Part = part
+	self.Surface = surface
+	self.Saved2D = {Size = main.Size, Position = main.Position, Scale = self.TargetScale}
+	main.Parent = surface
+	main.AnchorPoint = Vector2.new(0.5, 0.5)
+	main.Position = UDim2.fromScale(0.5, 0.5)
+	main.Size = UDim2.fromOffset(
+		math.min(self.Saved2D.Size.X.Offset, Canvas3D.X - 24),
+		math.min(self.Saved2D.Size.Y.Offset, Canvas3D.Y - 24)
+	)
+	self.TargetScale = 1
+	if not self.Hidden then
+		self.UIScale.Scale = 1
+	end
+	self.Mode3D = true
+	self.Exit3D.Visible = true
+	self.Fly = 1
+	self.Away = 0
+	self:Start3D()
+	if self.Hidden then
+		self:ShowBar3D(true)
+	else
+		self:Tween3D("Fly", 0, 0.85, Enum.EasingStyle.Back, Enum.EasingDirection.Out, nil)
+	end
+	return true
+end
+
+function Window:ApplySaved(saved)
+	self.Loading = true
+	for flag, raw in pairs(saved) do
+		local object = self.Elements[flag]
+		if object then
+			pcall(function()
+				object:Set(Decode(raw))
+			end)
+		end
+	end
+	self.Loading = false
+	self.Dirty = false
+end
+
+function Window:MakeFooter()
+	if self.Closed then
+		return
+	end
+	local old = self.Footer
+	self.Footer = nil
+	self.Logo = nil
+	if old then
+		old:Destroy()
+	end
+	local footer = self:Make("Frame", {
+		Name = "Footer",
+		AnchorPoint = Vector2.new(0, 1),
+		Position = UDim2.fromScale(0, 1),
+		Size = UDim2.new(1, 0, 0, FooterHeight),
+		BorderSizePixel = 0,
+		Active = true,
+		ZIndex = 60,
+		Parent = self.Main
+	}, {BackgroundColor3 = "Top"})
+	self:Make("Frame", {
+		Size = UDim2.new(1, 0, 0, 1),
+		BorderSizePixel = 0,
+		ZIndex = 61,
+		Parent = footer
+	}, {BackgroundColor3 = "Border"})
+	local logo = Create("ImageLabel", {
+		Name = "GraphiteLogo",
+		AnchorPoint = Vector2.new(0, 0.5),
+		Position = UDim2.new(0, 8, 0.5, 1),
+		Size = UDim2.fromOffset(170, 38),
+		BackgroundTransparency = 1,
+		Image = LogoImage,
+		ScaleType = Enum.ScaleType.Crop,
+		ZIndex = 62,
+		Parent = footer
+	})
+	self.Footer = footer
+	self.Logo = logo
+	if self.AttachDrag then
+		self.AttachDrag(footer)
+	end
+	self:GuardLogo(footer, logo)
+end
+
+function Window:GuardLogo(footer, logo)
+	local function Fix()
+		if self.Closed or self.Fixing then
+			return
+		end
+		task.defer(function()
+			if not self.Closed then
+				self:EnsureLogo()
+			end
+		end)
+	end
+	for _, property in ipairs({"Parent", "Visible"}) do
+		self:Connect(footer:GetPropertyChangedSignal(property), Fix)
+	end
+	for _, property in ipairs({"Parent", "Visible", "Image", "ImageTransparency", "Size"}) do
+		self:Connect(logo:GetPropertyChangedSignal(property), Fix)
+	end
+	self:Connect(footer.Destroying, Fix)
+	self:Connect(logo.Destroying, Fix)
+end
+
+function Window:EnsureLogo()
+	if self.Closed or self.Fixing then
+		return
+	end
+	local footer = self.Footer
+	local logo = self.Logo
+	local healthy = footer and logo
+		and footer.Parent == self.Main and logo.Parent == footer
+		and footer.Visible and logo.Visible
+		and logo.Image == LogoImage
+		and (logo.ImageTransparency or 0) == 0
+		and logo.Size.X.Offset >= 120 and logo.Size.Y.Offset >= 28
+		and footer.Size.Y.Offset >= FooterHeight
+	if healthy then
+		return
+	end
+	if (self.LogoFixes or 0) >= 25 then
+		return
+	end
+	self.LogoFixes = (self.LogoFixes or 0) + 1
+	self.Fixing = true
+	self:MakeFooter()
+	self.Fixing = false
+end
+
 function Window:OpenMenu()
 	self.Gated = false
 	if self.Closed then
 		return
 	end
+	self:EnsureLogo()
 	self.Main.Visible = true
 	self.Main.GroupTransparency = 1
 	self.UIScale.Scale = self.TargetScale * 0.85
@@ -632,7 +1247,7 @@ function Window:GateCard(width, height)
 		GroupTransparency = 1,
 		Parent = self.Gui
 	}, {BackgroundColor3 = "Top"})
-	Round(card, 10)
+	Round(card, 5)
 	local edge = Create("Frame", {
 		Position = UDim2.fromOffset(1, 1),
 		Size = UDim2.new(1, -2, 1, -2),
@@ -641,8 +1256,8 @@ function Window:GateCard(width, height)
 		ZIndex = 20,
 		Parent = card
 	})
-	Round(edge, 9)
-	self:Stroke(edge)
+	Round(edge, 5)
+	self:Stroke(edge, "Border")
 	local pop = Create("UIScale", {Scale = 0.9, Parent = card})
 	Animate(pop, {Scale = 1}, 0.3, Enum.EasingStyle.Back)
 	Animate(card, {GroupTransparency = 0}, 0.2)
@@ -660,11 +1275,21 @@ function Window:CloseCard(card, after)
 end
 
 function Window:ShowLoading(config, seconds, done)
-	local card = self:GateCard(320, 150)
+	local card = self:GateCard(340, 214)
+	Create("ImageLabel", {
+		Name = "GraphiteLogo",
+		AnchorPoint = Vector2.new(0.5, 0),
+		Position = UDim2.new(0.5, 0, 0, 14),
+		Size = UDim2.fromOffset(260, 66),
+		BackgroundTransparency = 1,
+		Image = LogoImage,
+		ScaleType = Enum.ScaleType.Crop,
+		Parent = card
+	})
 	local orbit = Create("Frame", {
 		AnchorPoint = Vector2.new(0.5, 0.5),
-		Position = UDim2.fromOffset(44, 42),
-		Size = UDim2.fromOffset(40, 40),
+		Position = UDim2.new(0.5, 0, 0, 108),
+		Size = UDim2.fromOffset(36, 36),
 		BackgroundTransparency = 1,
 		Parent = card
 	})
@@ -684,18 +1309,18 @@ function Window:ShowLoading(config, seconds, done)
 		local ring = Create("Frame", {
 			AnchorPoint = Vector2.new(0.5, 0.5),
 			Position = UDim2.fromScale(0.5, 0.5),
-			Size = UDim2.fromOffset(32, 32),
+			Size = UDim2.fromOffset(28, 28),
 			BackgroundTransparency = 1,
 			BorderSizePixel = 0,
 			Parent = orbit
 		})
 		Create("UICorner", {CornerRadius = UDim.new(1, 0), Parent = ring})
-		local ringStroke = Create("UIStroke", {Thickness = 3, Transparency = 0.45, Parent = ring})
+		local ringStroke = Create("UIStroke", {Thickness = 3, Transparency = 0.5, Parent = ring})
 		self:Paint(ringStroke, "Color", "Stroke")
 		local dot = self:Make("Frame", {
 			AnchorPoint = Vector2.new(0.5, 0.5),
-			Position = UDim2.fromOffset(20, 4),
-			Size = UDim2.fromOffset(10, 10),
+			Position = UDim2.fromOffset(18, 4),
+			Size = UDim2.fromOffset(9, 9),
 			BorderSizePixel = 0,
 			Parent = orbit
 		}, {BackgroundColor3 = "Accent"})
@@ -713,40 +1338,31 @@ function Window:ShowLoading(config, seconds, done)
 		end
 	})
 
-	self:Make("TextLabel", {
-		Position = UDim2.fromOffset(78, 20),
-		Size = UDim2.new(1, -98, 0, 24),
+	local first = config.Text or ("Loading " .. (config.Title or self.Name) .. "...")
+	local status = self:Make("TextLabel", {
+		Position = UDim2.fromOffset(20, 134),
+		Size = UDim2.new(1, -40, 0, 18),
 		BackgroundTransparency = 1,
-		Font = Enum.Font.GothamBold,
-		TextSize = 17,
-		TextXAlignment = Enum.TextXAlignment.Left,
+		Font = Enum.Font.GothamMedium,
+		TextSize = 13,
+		TextXAlignment = Enum.TextXAlignment.Center,
 		TextTruncate = Enum.TextTruncate.AtEnd,
-		Text = config.Title or self.Name,
+		Text = first,
 		Parent = card
 	}, {TextColor3 = "Text"})
-	local status = self:Make("TextLabel", {
-		Position = UDim2.fromOffset(78, 46),
-		Size = UDim2.new(1, -98, 0, 16),
-		BackgroundTransparency = 1,
-		Font = Enum.Font.Gotham,
-		TextSize = 12,
-		TextXAlignment = Enum.TextXAlignment.Left,
-		Text = config.Text or "Loading...",
-		Parent = card
-	}, {TextColor3 = "Sub"})
 	local track = self:Make("Frame", {
-		Position = UDim2.fromOffset(22, 88),
-		Size = UDim2.new(1, -44, 0, 8),
+		Position = UDim2.fromOffset(20, 160),
+		Size = UDim2.new(1, -40, 0, 6),
 		BorderSizePixel = 0,
 		Parent = card
 	}, {BackgroundColor3 = "Stroke"})
-	Round(track, 4)
+	Round(track, 3)
 	local fill = self:Make("Frame", {
 		Size = UDim2.new(0, 0, 1, 0),
 		BorderSizePixel = 0,
 		Parent = track
 	}, {BackgroundColor3 = "Accent"})
-	Round(fill, 4)
+	Round(fill, 3)
 	local tips = {
 		"Drag the top bar to move the menu.",
 		"Drag the bottom corner to resize it.",
@@ -754,19 +1370,20 @@ function Window:ShowLoading(config, seconds, done)
 		"Press the + button to bring a hidden menu back."
 	}
 	self:Make("TextLabel", {
-		Position = UDim2.fromOffset(22, 108),
-		Size = UDim2.new(1, -90, 0, 28),
+		Position = UDim2.fromOffset(20, 174),
+		Size = UDim2.new(1, -90, 0, 30),
 		BackgroundTransparency = 1,
 		Font = Enum.Font.Gotham,
 		TextSize = 11,
 		TextXAlignment = Enum.TextXAlignment.Left,
+		TextYAlignment = Enum.TextYAlignment.Top,
 		TextWrapped = true,
 		Text = config.Tip or tips[math.random(1, #tips)],
 		Parent = card
 	}, {TextColor3 = "Sub"})
 	local percent = self:Make("TextLabel", {
 		AnchorPoint = Vector2.new(1, 0),
-		Position = UDim2.new(1, -22, 0, 108),
+		Position = UDim2.new(1, -20, 0, 174),
 		Size = UDim2.fromOffset(60, 18),
 		BackgroundTransparency = 1,
 		Font = Enum.Font.GothamBold,
@@ -776,7 +1393,7 @@ function Window:ShowLoading(config, seconds, done)
 		Parent = card
 	}, {TextColor3 = "Text"})
 
-	local stages = {config.Text or "Loading...", "Preparing menu...", "Almost ready..."}
+	local stages = {first, "Preparing menu...", "Almost ready..."}
 	local connection = fill:GetPropertyChangedSignal("Size"):Connect(function()
 		local ratio = fill.Size.X.Scale
 		percent.Text = string.format("%d%%", math.floor(ratio * 100 + 0.5))
@@ -877,6 +1494,15 @@ function Window:ShowKeyGate(options, done)
 		order = order + 1
 		return order
 	end
+	Create("ImageLabel", {
+		Name = "GraphiteLogo",
+		LayoutOrder = 0,
+		Size = UDim2.new(1, 0, 0, 78),
+		BackgroundTransparency = 1,
+		Image = LogoImage,
+		ScaleType = Enum.ScaleType.Crop,
+		Parent = body
+	})
 	self:Make("TextLabel", {
 		LayoutOrder = Next(),
 		Size = UDim2.new(1, 0, 0, 0),
@@ -915,7 +1541,7 @@ function Window:ShowKeyGate(options, done)
 			Text = links[1],
 			Parent = body
 		}, {BackgroundColor3 = "Top", TextColor3 = "Sub"})
-		Round(linkBox, 6)
+		Round(linkBox, 4)
 		self:Stroke(linkBox)
 	end
 	local keyBox = self:Make("TextBox", {
@@ -929,7 +1555,7 @@ function Window:ShowKeyGate(options, done)
 		Text = "",
 		Parent = body
 	}, {BackgroundColor3 = "Top", TextColor3 = "Text", PlaceholderColor3 = "Sub"})
-	Round(keyBox, 6)
+	Round(keyBox, 4)
 	self:Stroke(keyBox)
 	local status = self:Make("TextLabel", {
 		LayoutOrder = Next(),
@@ -968,7 +1594,7 @@ function Window:ShowKeyGate(options, done)
 			Text = text,
 			Parent = buttons
 		}, {BackgroundColor3 = "Element", TextColor3 = "Text"})
-		Round(button, 6)
+		Round(button, 4)
 		Hover(self, button)
 		self:Pressable(button)
 		button.MouseButton1Click:Connect(callback)
@@ -1079,7 +1705,7 @@ function Window:RunGate(config)
 end
 
 function Window:Rebuild()
-	self.Theme = BuildTheme(self.Base, self.TextColor, self.AccentColor)
+	self.Theme = BuildTheme(self.Base, self.TextColor, self.AccentColor, self.BorderColor)
 	self:RunHooks()
 end
 
@@ -1093,6 +1719,9 @@ function Window:SyncPickers()
 	if self.AccentPicker then
 		self.AccentPicker:Set(self.Theme.Accent, true)
 	end
+	if self.BorderPicker then
+		self.BorderPicker:Set(self.Theme.Border, true)
+	end
 end
 
 function Window:SetMenuColor(color)
@@ -1103,6 +1732,9 @@ function Window:SetMenuColor(color)
 	end
 	if not self.AccentColor and self.AccentPicker then
 		self.AccentPicker:Set(self.Theme.Accent, true)
+	end
+	if not self.BorderColor and self.BorderPicker then
+		self.BorderPicker:Set(self.Theme.Border, true)
 	end
 end
 
@@ -1116,10 +1748,16 @@ function Window:SetAccent(color)
 	self:Rebuild()
 end
 
+function Window:SetBorderColor(color)
+	self.BorderColor = color
+	self:Rebuild()
+end
+
 function Window:ResetColors()
 	self.Base = DefaultBase
 	self.TextColor = nil
 	self.AccentColor = nil
+	self.BorderColor = nil
 	self:Rebuild()
 	self:SyncPickers()
 end
@@ -1138,6 +1776,9 @@ function Window:SetTitle(text)
 end
 
 function Window:Clamp()
+	if self.Mode3D then
+		return
+	end
 	local view = ViewSize(self.Gui)
 	local scale = self.TargetScale
 	local size = self.Main.Size
@@ -1169,6 +1810,9 @@ function Window:ClampRestore()
 end
 
 function Window:OnViewport()
+	if self.Mode3D then
+		return
+	end
 	local view = ViewSize(self.Gui)
 	local size = self.Main.Size
 	local fit = math.min((view.X - 20) / size.X.Offset, (view.Y - 20) / size.Y.Offset)
@@ -1204,19 +1848,26 @@ function Window:SetOpacity(percent)
 end
 
 function Window:ResetLayout()
+	if self.Mode3D then
+		return
+	end
 	self.Main.Size = UDim2.fromOffset(self.BaseSize.X, self.BaseSize.Y)
 	self.Main.Position = UDim2.fromScale(0.5, 0.5)
 	self:SetScale(self.AutoScale)
 end
 
 function Window:SetHidden(state)
-	if self.Closed or self.Gated or self.Hidden == state then
+	if self.Closed or self.Gated or self.Leaving or self.Hidden == state then
 		return
 	end
 	self:CloseDialog()
 	self.Hidden = state
 	self.Token = self.Token + 1
 	local token = self.Token
+	if self.Mode3D then
+		self:Fly3D(state)
+		return
+	end
 	if state then
 		Animate(self.UIScale, {Scale = self.TargetScale * 0.85}, 0.18)
 		local tween = Animate(self.Main, {GroupTransparency = 1}, 0.18)
@@ -1230,6 +1881,7 @@ function Window:SetHidden(state)
 		Animate(self.RestoreScale, {Scale = 1}, 0.28, Enum.EasingStyle.Back)
 		self:ClampRestore()
 	else
+		self:EnsureLogo()
 		self.Restore.Visible = false
 		self.Main.Visible = true
 		self.Main.GroupTransparency = 1
@@ -1279,8 +1931,8 @@ function Window:Dialog(config)
 		BorderSizePixel = 0,
 		Parent = overlay
 	}, {BackgroundColor3 = "Top"})
-	Round(box, 8)
-	self:Stroke(box)
+	Round(box, 5)
+	self:Stroke(box, "Border")
 	Pad(box, 14, 14, 14, 14)
 	Create("UIListLayout", {Padding = UDim.new(0, 10), SortOrder = Enum.SortOrder.LayoutOrder, Parent = box})
 	local boxScale = Create("UIScale", {Scale = 0.85, Parent = box})
@@ -1341,7 +1993,7 @@ function Window:Dialog(config)
 			Text = spec.Name,
 			Parent = row
 		}, {BackgroundColor3 = "Element", TextColor3 = "Text"})
-		Round(button, 6)
+		Round(button, 4)
 		button.ClipsDescendants = true
 		Hover(self, button)
 		self:Pressable(button)
@@ -1371,6 +2023,9 @@ end
 function Window:Destroy()
 	if self.Closed then
 		return
+	end
+	if self.Mode3D then
+		self:Stop3D()
 	end
 	self.Closed = true
 	if ActiveWindow == self then
@@ -1434,7 +2089,7 @@ function Window:Notify(config)
 		GroupTransparency = 1,
 		Parent = holder
 	})
-	Round(card, 8)
+	Round(card, 5)
 
 	local edge = Create("Frame", {
 		Position = UDim2.fromOffset(1, 1),
@@ -1444,9 +2099,9 @@ function Window:Notify(config)
 		ZIndex = 4,
 		Parent = card
 	})
-	Round(edge, 7)
+	Round(edge, 4)
 	Create("UIStroke", {
-		Color = theme.Stroke,
+		Color = theme.Border,
 		Thickness = 1,
 		ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
 		Parent = edge
@@ -1661,7 +2316,9 @@ function Window:BuildScriptFile()
 		"g.GraphiteSaved = " .. Serialize(data)
 	}
 	local source = self.Source
-	if string.match(source, "^https?://%S+$") then
+	if type(source) ~= "string" or source == "" then
+		table.insert(lines, "end")
+	elseif string.match(source, "^https?://%S+$") then
 		table.insert(lines, "end")
 		table.insert(lines, "loadstring(game:HttpGet(" .. string.format("%q", source) .. "))()")
 	else
@@ -1676,16 +2333,15 @@ function Window:SaveScriptFile()
 	if type(writefile) ~= "function" then
 		return false, "Files are only available in an executor"
 	end
-	if type(self.Source) ~= "string" or self.Source == "" then
-		return false, "No script source is set. Use the all-in-one script or pass Source to CreateWindow"
-	end
+	local hasSource = type(self.Source) == "string" and self.Source ~= ""
 	local ok, err = pcall(function()
 		writefile(self.FileName, self:BuildScriptFile())
 	end)
-	if ok then
-		self.Dirty = false
+	if not ok then
+		return false, err
 	end
-	return ok, err
+	self.Dirty = false
+	return true, (not hasSource) and "settings only" or nil
 end
 
 function Window:RunScriptFile()
@@ -1707,9 +2363,22 @@ function Window:RunScriptFile()
 		return false, "The saved file is damaged"
 	end
 	task.spawn(function()
+		local shared = GlobalEnv()
+		shared.GraphiteSaved = nil
+		local before = shared.GraphiteWindows or 0
 		local passed, problem = pcall(chunk)
 		if passed then
-			self:Destroy()
+			if (shared.GraphiteWindows or 0) > before then
+				shared.GraphiteSaved = nil
+				self:Destroy()
+			else
+				local saved = shared.GraphiteSaved
+				shared.GraphiteSaved = nil
+				if type(saved) == "table" then
+					self:ApplySaved(saved)
+				end
+				self:Status("Loaded", self.FileName)
+			end
 		else
 			warn("[Graphite] " .. tostring(problem))
 			if not self.Closed then
@@ -1761,7 +2430,7 @@ function Window:CreateTab(name, icon)
 		LayoutOrder = tab.Index,
 		Parent = self.TabList
 	})
-	Round(button, 6)
+	Round(button, 4)
 
 	local textOffset = 12
 	local iconLabel
@@ -1842,7 +2511,7 @@ function Window:CreateTab(name, icon)
 	end
 
 	button.MouseEnter:Connect(function()
-		if not tab.Active then
+		if CanHover() and not tab.Active then
 			Animate(button, {BackgroundTransparency = 0.6}, 0.1)
 		end
 	end)
@@ -1875,7 +2544,7 @@ local function NewRow(tab, height, class)
 		row.AutoButtonColor = false
 		row.ClipsDescendants = true
 	end
-	Round(row, 6)
+	Round(row, 4)
 	tab.Window:Stroke(row, "Stroke", 0.6)
 	local win = tab.Window
 	if win:IsFresh() and tab.Page.Visible then
@@ -1975,7 +2644,7 @@ function Tab:CreateGroup(config)
 		Text = "",
 		Parent = holder
 	}, {BackgroundColor3 = "Element"})
-	Round(header, 6)
+	Round(header, 4)
 	win:Stroke(header, "Stroke", 0.6)
 	Hover(win, header)
 	win:Pressable(header)
@@ -2160,7 +2829,7 @@ function Tab:CreateParagraph(config)
 		LayoutOrder = self.Order,
 		Parent = self.Page
 	}, {BackgroundColor3 = "Element"})
-	Round(row, 6)
+	Round(row, 4)
 	win:Stroke(row, "Stroke", 0.6)
 	Pad(row, 12, 9, 12, 9)
 	Create("UIListLayout", {Padding = UDim.new(0, 3), SortOrder = Enum.SortOrder.LayoutOrder, Parent = row})
@@ -2209,7 +2878,7 @@ function Tab:CreateImage(config)
 		ScaleType = config.Crop and Enum.ScaleType.Crop or Enum.ScaleType.Fit,
 		Parent = row
 	})
-	Round(image, 6)
+	Round(image, 4)
 	local object = {}
 	function object:SetImage(id)
 		image.Image = ParseImage(id) or ""
@@ -2258,7 +2927,7 @@ function Tab:CreateGallery(config)
 			Text = "",
 			Parent = scroller
 		}, {BackgroundColor3 = "Hover"})
-		Round(item, 6)
+		Round(item, 4)
 		Create("ImageLabel", {
 			Position = UDim2.fromOffset(6, 6),
 			Size = UDim2.fromOffset(64, 44),
@@ -2324,7 +2993,9 @@ function Tab:CreateButton(config)
 		bar.BackgroundColor3 = config.Danger and NoteColors.Error or win.Theme.Accent
 	end)
 	row.MouseEnter:Connect(function()
-		Animate(bar, {Size = UDim2.fromOffset(3, height - 20)}, 0.14)
+		if CanHover() then
+			Animate(bar, {Size = UDim2.fromOffset(3, height - 20)}, 0.14)
+		end
 	end)
 	row.MouseLeave:Connect(function()
 		Animate(bar, {Size = UDim2.fromOffset(3, 0)}, 0.14)
@@ -2520,7 +3191,7 @@ function Tab:CreateSlider(config)
 		Text = "",
 		Parent = row
 	}, {BackgroundColor3 = "Top", TextColor3 = "Text"})
-	Round(box, 6)
+	Round(box, 4)
 	win:Stroke(box)
 
 	local function StepButton(text, offset)
@@ -2536,7 +3207,7 @@ function Tab:CreateSlider(config)
 			Text = text,
 			Parent = row
 		}, {BackgroundColor3 = "Top", TextColor3 = "Text"})
-		Round(button, 6)
+		Round(button, 4)
 		win:Stroke(button)
 		Hover(win, button, "Top", "Hover")
 		win:Pressable(button, "Top")
@@ -2644,7 +3315,7 @@ function Tab:CreateSlider(config)
 		ZIndex = 6,
 		Parent = knob
 	}, {BackgroundColor3 = "Top", TextColor3 = "Text"})
-	Round(bubble, 6)
+	Round(bubble, 4)
 	Pad(bubble, 8, 0, 8, 0)
 
 	local hit = Create("TextButton", {
@@ -3348,7 +4019,7 @@ function Window:AddTopEntry(name, icon, page)
 		Text = "",
 		Parent = self.Strip
 	})
-	Round(pill, 6)
+	Round(pill, 4)
 	local iconLabel
 	if image then
 		iconLabel = Create("ImageLabel", {
@@ -3384,7 +4055,7 @@ function Window:AddTopEntry(name, icon, page)
 		entry.Render(0)
 	end)
 	pill.MouseEnter:Connect(function()
-		if not entry.Active then
+		if CanHover() and not entry.Active then
 			Animate(pill, {BackgroundTransparency = 0.6}, 0.1)
 		end
 	end)
@@ -3652,30 +4323,30 @@ function Window:BuildProfile(config)
 	local player = LocalPlayer
 	local userId = player and player.UserId or 0
 
-	tab:CreateSection("Player")
-	local card = NewRow(tab, 92)
+	local card = NewRow(tab, 100)
 	local avatar = self:Make("ImageLabel", {
-		Position = UDim2.fromOffset(14, 10),
+		Name = "Avatar",
+		Position = UDim2.fromOffset(14, 14),
 		Size = UDim2.fromOffset(72, 72),
 		BorderSizePixel = 0,
 		Image = "rbxthumb://type=AvatarHeadShot&id=" .. tostring(userId) .. "&w=150&h=150",
 		Parent = card
 	}, {BackgroundColor3 = "Top"})
 	Round(avatar, 36)
-	self:Stroke(avatar)
+	self:Stroke(avatar, "Border")
 	self:Make("TextLabel", {
 		Position = UDim2.fromOffset(100, 14),
 		Size = UDim2.new(1, -112, 0, 24),
 		BackgroundTransparency = 1,
 		Font = Enum.Font.GothamBold,
-		TextSize = 16,
+		TextSize = 17,
 		TextXAlignment = Enum.TextXAlignment.Left,
 		TextTruncate = Enum.TextTruncate.AtEnd,
 		Text = player and player.DisplayName or "Player",
 		Parent = card
 	}, {TextColor3 = "Text"})
 	self:Make("TextLabel", {
-		Position = UDim2.fromOffset(100, 40),
+		Position = UDim2.fromOffset(100, 41),
 		Size = UDim2.new(1, -112, 0, 18),
 		BackgroundTransparency = 1,
 		Font = Enum.Font.Gotham,
@@ -3686,36 +4357,117 @@ function Window:BuildProfile(config)
 		Parent = card
 	}, {TextColor3 = "Sub"})
 	self:Make("TextLabel", {
-		Position = UDim2.fromOffset(100, 60),
-		Size = UDim2.new(1, -112, 0, 18),
+		Position = UDim2.fromOffset(100, 62),
+		Size = UDim2.fromOffset(84, 18),
 		BackgroundTransparency = 1,
 		Font = Enum.Font.Gotham,
-		TextSize = 12,
+		TextSize = 11,
 		TextXAlignment = Enum.TextXAlignment.Left,
 		Text = "ID " .. tostring(userId),
 		Parent = card
 	}, {TextColor3 = "Sub"})
+	local member = self:Make("TextLabel", {
+		Position = UDim2.fromOffset(188, 62),
+		Size = UDim2.new(1, -200, 0, 18),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.GothamMedium,
+		TextSize = 11,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		Text = "-",
+		Parent = card
+	}, {TextColor3 = "Accent"})
 
-	tab:CreateSection("Account")
-	local created = InfoRow(tab, "Account Created")
-	local age = InfoRow(tab, "Account Age")
-	local member = InfoRow(tab, "Membership")
+	tab:CreateSection("Stats")
+	tab.Order = tab.Order + 1
+	local grid = Create("Frame", {
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1,
+		LayoutOrder = tab.Order,
+		Parent = tab.Page
+	})
+	Create("UIGridLayout", {
+		CellSize = UDim2.new(0.5, -4, 0, 56),
+		CellPadding = UDim2.fromOffset(8, 8),
+		SortOrder = Enum.SortOrder.LayoutOrder,
+		Parent = grid
+	})
 
-	tab:CreateSection("Session")
-	local menuTime = InfoRow(tab, "Menu Time")
-	local clock = InfoRow(tab, "Current Time")
-	local gameName = InfoRow(tab, "Game")
-	local serverId, serverRow = InfoRow(tab, "Server ID", true)
-	local playerCount = InfoRow(tab, "Players In Server")
-	local ping = InfoRow(tab, "Ping")
-	Hover(self, serverRow)
-	serverRow.MouseButton1Click:Connect(function()
+	local function Stat(name, order, clickable)
+		local box = self:Make(clickable and "TextButton" or "Frame", {
+			LayoutOrder = order,
+			BorderSizePixel = 0,
+			Parent = grid
+		}, {BackgroundColor3 = "Element"})
+		if clickable then
+			box.Text = ""
+			box.AutoButtonColor = false
+		end
+		Round(box, 4)
+		self:Stroke(box, "Stroke", 0.6)
+		self:Make("TextLabel", {
+			Position = UDim2.fromOffset(12, 8),
+			Size = UDim2.new(1, -24, 0, 14),
+			BackgroundTransparency = 1,
+			Font = Enum.Font.Gotham,
+			TextSize = 11,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			Text = name,
+			Parent = box
+		}, {TextColor3 = "Sub"})
+		local value = self:Make("TextLabel", {
+			Position = UDim2.fromOffset(12, 26),
+			Size = UDim2.new(1, -24, 0, 22),
+			BackgroundTransparency = 1,
+			Font = Enum.Font.GothamMedium,
+			TextSize = 14,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			TextTruncate = Enum.TextTruncate.AtEnd,
+			Text = "-",
+			Parent = box
+		}, {TextColor3 = "Text"})
+		return value, box
+	end
+
+	local created = Stat("Account Created", 1)
+	local age = Stat("Account Age", 2)
+	local menuTime = Stat("Menu Time", 3)
+	local clock = Stat("Current Time", 4)
+	local ping = Stat("Ping", 5)
+	local serverId, serverBox = Stat("Server ID (tap to copy)", 6, true)
+	Hover(self, serverBox)
+	self:Pressable(serverBox)
+	serverBox.MouseButton1Click:Connect(function()
 		if type(setclipboard) == "function" and pcall(setclipboard, game.JobId) then
 			self:Status("Saved", "Server ID copied")
 		else
 			self:Status("Error", "The clipboard is not supported here")
 		end
 	end)
+
+	local gameRow = NewRow(tab, 56)
+	self:Make("TextLabel", {
+		Position = UDim2.fromOffset(12, 8),
+		Size = UDim2.new(1, -24, 0, 14),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.Gotham,
+		TextSize = 11,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		Text = "Game",
+		Parent = gameRow
+	}, {TextColor3 = "Sub"})
+	local gameName = self:Make("TextLabel", {
+		Position = UDim2.fromOffset(12, 26),
+		Size = UDim2.new(1, -24, 0, 22),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.GothamMedium,
+		TextSize = 14,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		Text = "-",
+		Parent = gameRow
+	}, {TextColor3 = "Text"})
 
 	local recent = tab:CreateParagraph({Title = "Recent Games", Content = "-"})
 
@@ -3767,8 +4519,6 @@ function Window:BuildProfile(config)
 		end
 		menuTime.Text = Duration(os.clock() - self.Created)
 		clock.Text = os.date("%H:%M:%S")
-		local count = #Players:GetPlayers()
-		playerCount.Text = count .. " / " .. tostring(Players.MaxPlayers or "?")
 		local ok, value = pcall(function()
 			return math.floor(Stats.Network.ServerStatsItem["Data Ping"]:GetValue() + 0.5)
 		end)
@@ -3777,7 +4527,7 @@ function Window:BuildProfile(config)
 	end
 
 	tab:CreateSection("Friends Online")
-	local listRow = NewRow(tab, 262)
+	local listRow = NewRow(tab, 172)
 	local countLabel = self:Make("TextLabel", {
 		Position = UDim2.fromOffset(12, 0),
 		Size = UDim2.new(1, -24, 0, 26),
@@ -3794,14 +4544,21 @@ function Window:BuildProfile(config)
 		BackgroundTransparency = 1,
 		BorderSizePixel = 0,
 		ScrollBarThickness = 3,
+		ScrollingDirection = Enum.ScrollingDirection.X,
 		CanvasSize = UDim2.new(),
-		AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		AutomaticCanvasSize = Enum.AutomaticSize.X,
 		Parent = listRow
 	}, {ScrollBarImageColor3 = "Stroke"})
-	Create("UIListLayout", {Padding = UDim.new(0, 5), SortOrder = Enum.SortOrder.LayoutOrder, Parent = friendList})
+	Create("UIListLayout", {
+		FillDirection = Enum.FillDirection.Horizontal,
+		Padding = UDim.new(0, 8),
+		SortOrder = Enum.SortOrder.LayoutOrder,
+		Parent = friendList
+	})
+	Pad(friendList, 2, 2, 2, 6)
 	local empty = self:Make("TextLabel", {
 		LayoutOrder = 0,
-		Size = UDim2.new(1, -6, 0, 40),
+		Size = UDim2.fromOffset(260, 120),
 		BackgroundTransparency = 1,
 		Font = Enum.Font.Gotham,
 		TextSize = 12,
@@ -3810,50 +4567,50 @@ function Window:BuildProfile(config)
 	}, {TextColor3 = "Sub"})
 	local moreButton = self:Make("TextButton", {
 		LayoutOrder = 100000,
-		Size = UDim2.new(1, -6, 0, 34),
+		Size = UDim2.fromOffset(92, 120),
 		BorderSizePixel = 0,
 		AutoButtonColor = false,
 		Font = Enum.Font.GothamMedium,
 		TextSize = 12,
+		TextWrapped = true,
 		Text = "Show more",
 		Visible = false,
 		Parent = friendList
 	}, {BackgroundColor3 = "Hover", TextColor3 = "Text"})
-	Round(moreButton, 6)
+	Round(moreButton, 4)
 
 	local friends = {}
 	local shown = 0
 	local fetched = false
 
-	local function AddRow(friend, index)
-		local row = self:Make("Frame", {
+	local function AddCard(friend, index)
+		local box = self:Make("Frame", {
 			LayoutOrder = index,
-			Size = UDim2.new(1, -6, 0, 50),
+			Size = UDim2.fromOffset(92, 120),
 			BorderSizePixel = 0,
 			Parent = friendList
 		}, {BackgroundColor3 = "Top"})
-		row:SetAttribute("FriendRow", true)
-		Round(row, 6)
+		box:SetAttribute("FriendRow", true)
+		Round(box, 4)
+		self:Stroke(box, "Stroke", 0.5)
 		local photo = Create("ImageLabel", {
-			Position = UDim2.fromOffset(8, 7),
-			Size = UDim2.fromOffset(36, 36),
+			AnchorPoint = Vector2.new(0.5, 0),
+			Position = UDim2.new(0.5, 0, 0, 8),
+			Size = UDim2.fromOffset(52, 52),
 			BackgroundTransparency = 1,
 			Image = "rbxthumb://type=AvatarHeadShot&id=" .. tostring(friend.VisitorId or 0) .. "&w=150&h=150",
-			Parent = row
+			Parent = box
 		})
 		Create("UICorner", {CornerRadius = UDim.new(1, 0), Parent = photo})
-		local joinable = type(friend.PlaceId) == "number" and type(friend.GameId) == "string" and friend.GameId ~= ""
-		local reserve = joinable and 76 or 60
 		self:Make("TextLabel", {
-			Position = UDim2.fromOffset(52, 6),
-			Size = UDim2.new(1, -(52 + reserve), 0, 18),
+			Position = UDim2.fromOffset(4, 64),
+			Size = UDim2.new(1, -8, 0, 16),
 			BackgroundTransparency = 1,
 			Font = Enum.Font.GothamMedium,
-			TextSize = 13,
-			TextXAlignment = Enum.TextXAlignment.Left,
+			TextSize = 12,
 			TextTruncate = Enum.TextTruncate.AtEnd,
 			Text = friend.DisplayName or friend.UserName or "Friend",
-			Parent = row
+			Parent = box
 		}, {TextColor3 = "Text"})
 		local where = "Online"
 		if friend.IsOnline == false then
@@ -3862,30 +4619,29 @@ function Window:BuildProfile(config)
 			where = friend.LastLocation
 		end
 		self:Make("TextLabel", {
-			Position = UDim2.fromOffset(52, 26),
-			Size = UDim2.new(1, -(52 + reserve), 0, 16),
+			Position = UDim2.fromOffset(4, 80),
+			Size = UDim2.new(1, -8, 0, 14),
 			BackgroundTransparency = 1,
 			Font = Enum.Font.Gotham,
-			TextSize = 11,
-			TextXAlignment = Enum.TextXAlignment.Left,
+			TextSize = 10,
 			TextTruncate = Enum.TextTruncate.AtEnd,
 			Text = where,
-			Parent = row
+			Parent = box
 		}, {TextColor3 = "Sub"})
+		local joinable = type(friend.PlaceId) == "number" and type(friend.GameId) == "string" and friend.GameId ~= ""
 		if joinable then
 			local join = self:Make("TextButton", {
-				AnchorPoint = Vector2.new(1, 0.5),
-				Position = UDim2.new(1, -8, 0.5, 0),
-				Size = UDim2.fromOffset(58, 30),
+				Position = UDim2.new(0, 8, 1, -28),
+				Size = UDim2.new(1, -16, 0, 22),
 				BorderSizePixel = 0,
 				AutoButtonColor = false,
 				ClipsDescendants = true,
 				Font = Enum.Font.GothamMedium,
 				TextSize = 12,
 				Text = "Join",
-				Parent = row
+				Parent = box
 			}, {BackgroundColor3 = "Element", TextColor3 = "Text"})
-			Round(join, 6)
+			Round(join, 4)
 			Hover(self, join)
 			self:Pressable(join)
 			join.MouseButton1Click:Connect(function()
@@ -3897,7 +4653,7 @@ function Window:BuildProfile(config)
 	local function ShowMore()
 		local limit = math.min(shown + 20, #friends)
 		for index = shown + 1, limit do
-			AddRow(friends[index], index)
+			AddCard(friends[index], index)
 		end
 		shown = limit
 		moreButton.Visible = shown < #friends
@@ -4012,7 +4768,7 @@ function Window:BuildProfile(config)
 end
 
 function Window:BuildTopTabs(config)
-	local menu = self:AddTopEntry("Menu", nil, nil)
+	local menu = self:AddTopEntry("Menu", Icons.List, nil)
 	self.MenuEntry = menu
 	menu.Active = true
 	menu.Render(0)
@@ -4072,10 +4828,10 @@ function Window:SetSidebar(visible)
 	if visible and not self.OnTop then
 		self.Side.Visible = true
 	end
-	Animate(self.Side, {Size = UDim2.new(0, width, 1, -TopHeight)}, 0.2)
+	Animate(self.Side, {Size = UDim2.new(0, width, 1, -(TopHeight + FooterHeight))}, 0.2)
 	local tween = Animate(self.Content, {
 		Position = UDim2.fromOffset(width, TopHeight),
-		Size = UDim2.new(1, -width, 1, -TopHeight)
+		Size = UDim2.new(1, -width, 1, -(TopHeight + FooterHeight))
 	}, 0.2)
 	tween.Completed:Connect(function()
 		if not self.SidebarVisible and not self.Closed then
@@ -4181,10 +4937,30 @@ function Window:RestoreDefaults()
 	if self.Watermark then
 		self.Watermark:SetVisible(false)
 	end
+	self:SetMode3D(false)
+	self:SetBorderThickness(1)
+	self.Depth = 7
+	self.TiltMax = 12
+	self.FollowMode = "Character"
+	if self.Toggle3D then
+		self.Toggle3D:Set(false, true)
+	end
+	if self.BorderSlider then
+		self.BorderSlider:Set(1, true)
+	end
+	if self.DepthSlider then
+		self.DepthSlider:Set(7, true)
+	end
+	if self.TiltSlider then
+		self.TiltSlider:Set(12, true)
+	end
+	if self.FollowDropdown then
+		self.FollowDropdown:Set("Character", true)
+	end
 end
 
 function Window:CreateSettingsTab(name, icon)
-	local tab = self:CreateTab(name or "Settings", icon)
+	local tab = self:CreateTab(name or "Settings", icon or Icons.Gear)
 	tab.IsSettings = true
 	self.SettingsTab = tab
 
@@ -4371,6 +5147,31 @@ function Window:CreateSettingsTab(name, icon)
 			picker:Set(self.Theme.Accent, true)
 		end
 	})
+	self.BorderPicker = tab:CreateColorPicker({
+		Name = "Border Color",
+		Default = self.Theme.Border,
+		Flag = "GraphiteBorderColor",
+		Callback = function(color)
+			self:SetBorderColor(color)
+		end,
+		OnReset = function(picker)
+			self.BorderColor = nil
+			self:Rebuild()
+			picker:Set(self.Theme.Border, true)
+		end
+	})
+	self.BorderSlider = tab:CreateSlider({
+		Name = "Border Thickness",
+		Min = 1,
+		Max = 6,
+		Increment = 1,
+		Default = self.BorderThickness,
+		Suffix = " px",
+		Flag = "GraphiteBorderThickness",
+		Callback = function(value)
+			self:SetBorderThickness(value)
+		end
+	})
 	tab:CreateButton({
 		Name = "Reset Theme",
 		Description = "Back to the black menu with white text",
@@ -4433,6 +5234,50 @@ function Window:CreateSettingsTab(name, icon)
 		end
 	})
 
+	tab:CreateSection("3D Menu")
+	self.Toggle3D = tab:CreateToggle({
+		Name = "3D Menu",
+		Description = "Float the menu in the game world. Only you can see it",
+		Default = false,
+		Callback = function(state)
+			local ok, err = self:SetMode3D(state)
+			if not ok then
+				self.Toggle3D:Set(false, true)
+				self:Status("Error", tostring(err))
+			end
+		end
+	})
+	self.DepthSlider = tab:CreateSlider({
+		Name = "3D Distance",
+		Min = 3,
+		Max = 14,
+		Increment = 1,
+		Default = self.Depth,
+		Suffix = " studs",
+		Callback = function(value)
+			self.Depth = value
+		end
+	})
+	self.TiltSlider = tab:CreateSlider({
+		Name = "3D Tilt",
+		Min = 0,
+		Max = 25,
+		Increment = 1,
+		Default = self.TiltMax,
+		Suffix = " deg",
+		Callback = function(value)
+			self.TiltMax = value
+		end
+	})
+	self.FollowDropdown = tab:CreateDropdown({
+		Name = "3D Follow",
+		Options = {"Character", "Camera"},
+		Default = self.FollowMode,
+		Callback = function(value)
+			self.FollowMode = value or "Character"
+		end
+	})
+
 	tab:CreateSection("Config")
 	local configName = "default"
 	tab:CreateInput({
@@ -4472,21 +5317,44 @@ function Window:CreateSettingsTab(name, icon)
 	})
 
 	tab:CreateSection("Script File")
-	tab:CreateButton({
+	local createButton
+	local runButton
+	local function Describe()
+		if createButton and runButton then
+			createButton:SetDescription("Saves " .. self.FileName .. " in the executor folder")
+			runButton:SetDescription("Runs " .. self.FileName .. " and restores your settings")
+		end
+	end
+	self.FileInput = tab:CreateInput({
+		Name = "File Name",
+		Default = self.FileName,
+		Placeholder = "Bio.Menu.txt",
+		Flag = "GraphiteFileName",
+		Callback = function(text)
+			local name = self:SetFileName(text)
+			if self.FileInput then
+				self.FileInput:Set(name, true)
+			end
+			Describe()
+		end
+	})
+	createButton = tab:CreateButton({
 		Name = "Create File",
+		Icon = Icons.File,
 		Description = "Saves " .. self.FileName .. " in the executor folder",
 		Callback = function()
 			local ok, err = self:SaveScriptFile()
 			if ok then
 				self:Flash()
-				self:Status("Saved", self.FileName)
+				self:Status("Saved", self.FileName .. (err and (" (" .. err .. ")") or ""))
 			else
 				self:Status("Error", tostring(err))
 			end
 		end
 	})
-	tab:CreateButton({
+	runButton = tab:CreateButton({
 		Name = "Run Saved File",
+		Icon = Icons.File,
 		Description = "Runs " .. self.FileName .. " and restores your settings",
 		Callback = function()
 			self:Confirm("Do you want to run the saved file? The current menu will be replaced.", function()
@@ -4541,6 +5409,7 @@ function Graphite.load(first, second, third)
 end
 
 Graphite.Load = Graphite.load
+Graphite.Icons = Icons
 
 function Graphite:CreateWindow(config)
 	config = config or {}
@@ -4568,7 +5437,8 @@ function Graphite:CreateWindow(config)
 	self.Base = config.MenuColor or DefaultBase
 	self.TextColor = config.TextColor
 	self.AccentColor = config.AccentColor or config.Accent
-	self.Theme = BuildTheme(self.Base, self.TextColor, self.AccentColor)
+	self.BorderColor = config.BorderColor
+	self.Theme = BuildTheme(self.Base, self.TextColor, self.AccentColor, self.BorderColor)
 	self.Born = os.clock()
 	self.Locked = false
 	self.Dirty = false
@@ -4586,9 +5456,20 @@ function Graphite:CreateWindow(config)
 	self.OnTop = false
 	self.Created = os.clock()
 	self.ConfirmTeleport = config.ConfirmTeleport ~= false
+	self.BorderThickness = 1
+	self.Depth = 7
+	self.TiltMax = 12
+	self.FollowMode = "Character"
+	self.Mode3D = false
+	self.LogoFixes = 0
+	self.Tilt = {x = 0, y = 0, tx = 0, ty = 0}
+	self.Fly = 0
+	self.Away = 0
+	self.Leaving = false
 	self.FileName = config.FileName or "Bio.Menu.txt"
 	local shared = GlobalEnv()
 	self.Source = config.Source or shared.GraphiteSourceText
+	shared.GraphiteWindows = (shared.GraphiteWindows or 0) + 1
 	if type(shared.GraphiteSaved) == "table" then
 		self.Pending = shared.GraphiteSaved
 		shared.GraphiteSaved = nil
@@ -4635,7 +5516,7 @@ function Graphite:CreateWindow(config)
 		GroupTransparency = 1,
 		Parent = gui
 	}, {BackgroundColor3 = "Main"})
-	Round(main, 10)
+	Round(main, 4)
 	self.Main = main
 	self.UIScale = Create("UIScale", {Scale = self.TargetScale * 0.85, Parent = main})
 	local gate = PendingLoad
@@ -4652,6 +5533,7 @@ function Graphite:CreateWindow(config)
 		Name = "Top",
 		Size = UDim2.new(1, 0, 0, TopHeight),
 		BorderSizePixel = 0,
+		Active = true,
 		Parent = main
 	}, {BackgroundColor3 = "Top"})
 
@@ -4685,21 +5567,41 @@ function Graphite:CreateWindow(config)
 	local buttonWidth = Touch and 38 or 32
 	local buttonHeight = Touch and 30 or 26
 
-	local function GlyphButton(parent, text, props)
+	local function GlyphButton(parent, text, props, icon)
 		props.Size = props.Size or UDim2.fromOffset(buttonWidth, buttonHeight)
 		props.BackgroundTransparency = 1
 		props.AutoButtonColor = false
 		props.Font = Enum.Font.GothamBold
 		props.TextSize = 14
-		props.Text = text
+		props.Text = icon and "" or text
 		props.Parent = parent
 		local button = self:Make("TextButton", props, {BackgroundColor3 = "Hover", TextColor3 = "Sub"})
 		Round(button, 5)
+		local image
+		if icon then
+			image = Create("ImageLabel", {
+				AnchorPoint = Vector2.new(0.5, 0.5),
+				Position = UDim2.fromScale(0.5, 0.5),
+				Size = UDim2.fromOffset(14, 14),
+				BackgroundTransparency = 1,
+				Image = icon,
+				Parent = button
+			})
+			self:Paint(image, "ImageColor3", "Sub")
+		end
 		button.MouseEnter:Connect(function()
-			Animate(button, {BackgroundTransparency = 0, TextColor3 = self.Theme.Text}, 0.1)
+			if CanHover() then
+				Animate(button, {BackgroundTransparency = 0, TextColor3 = self.Theme.Text}, 0.1)
+				if image then
+					Animate(image, {ImageColor3 = self.Theme.Text}, 0.1)
+				end
+			end
 		end)
 		button.MouseLeave:Connect(function()
 			Animate(button, {BackgroundTransparency = 1, TextColor3 = self.Theme.Sub}, 0.1)
+			if image then
+				Animate(image, {ImageColor3 = self.Theme.Sub}, 0.1)
+			end
 		end)
 		return button
 	end
@@ -4711,7 +5613,7 @@ function Graphite:CreateWindow(config)
 	local closeButton = GlyphButton(top, "X", {
 		AnchorPoint = Vector2.new(0, 0.5),
 		Position = UDim2.new(1, -(buttonWidth + 6), 0.5, 0)
-	})
+	}, Icons.Close)
 
 	local buttonsWidth = buttonWidth * 2 + 20
 	local stripX = titleOffset + titleWidth + 10
@@ -4736,12 +5638,23 @@ function Graphite:CreateWindow(config)
 		Parent = strip
 	})
 	self.Strip = strip
+	local function UpdateStrip()
+		local canvas = strip.AbsoluteCanvasSize
+		local size = strip.AbsoluteSize
+		if canvas and size then
+			strip.ScrollingEnabled = canvas.X > size.X + 1
+		end
+	end
+	self:Connect(strip:GetPropertyChangedSignal("AbsoluteCanvasSize"), UpdateStrip)
+	self:Connect(strip:GetPropertyChangedSignal("AbsoluteSize"), UpdateStrip)
+	UpdateStrip()
 
 	local side = self:Make("Frame", {
 		Position = UDim2.fromOffset(0, TopHeight),
-		Size = UDim2.new(0, 124, 1, -TopHeight),
+		Size = UDim2.new(0, 124, 1, -(TopHeight + FooterHeight)),
 		BorderSizePixel = 0,
 		ClipsDescendants = true,
+		Active = true,
 		Parent = main
 	}, {BackgroundColor3 = "Side"})
 	self:Make("Frame", {
@@ -4780,7 +5693,7 @@ function Graphite:CreateWindow(config)
 
 	local content = Create("Frame", {
 		Position = UDim2.fromOffset(124, TopHeight),
-		Size = UDim2.new(1, -124, 1, -TopHeight),
+		Size = UDim2.new(1, -124, 1, -(TopHeight + FooterHeight)),
 		BackgroundTransparency = 1,
 		ClipsDescendants = true,
 		Parent = main
@@ -4789,7 +5702,7 @@ function Graphite:CreateWindow(config)
 
 	self.TopContent = Create("Frame", {
 		Position = UDim2.fromOffset(0, TopHeight),
-		Size = UDim2.new(1, 0, 1, -TopHeight),
+		Size = UDim2.new(1, 0, 1, -(TopHeight + FooterHeight)),
 		BackgroundTransparency = 1,
 		ClipsDescendants = true,
 		Visible = false,
@@ -4804,8 +5717,10 @@ function Graphite:CreateWindow(config)
 		ZIndex = 200,
 		Parent = main
 	})
-	Round(edge, 9)
-	self.EdgeStroke = self:Stroke(edge)
+	Round(edge, 3)
+	self.EdgeStroke = self:Stroke(edge, "Border")
+	self.Edge = edge
+	self:SetBorderThickness(config.BorderThickness or 1)
 
 	local gripSize = Touch and 30 or 20
 	local grip = Create("TextButton", {
@@ -4814,7 +5729,7 @@ function Graphite:CreateWindow(config)
 		Size = UDim2.fromOffset(gripSize, gripSize),
 		BackgroundTransparency = 1,
 		Text = "",
-		ZIndex = 20,
+		ZIndex = 70,
 		Parent = main
 	})
 	for _, offset in ipairs({Vector2.new(-6, -6), Vector2.new(-6, -11), Vector2.new(-11, -6)}) do
@@ -4823,7 +5738,7 @@ function Graphite:CreateWindow(config)
 			Position = UDim2.new(1, offset.X, 1, offset.Y),
 			Size = UDim2.fromOffset(3, 3),
 			BorderSizePixel = 0,
-			ZIndex = 21,
+			ZIndex = 71,
 			Parent = grip
 		}, {BackgroundColor3 = "Sub"})
 		Round(dot, 2)
@@ -4860,11 +5775,11 @@ function Graphite:CreateWindow(config)
 		resizeOrigin = nil
 	end)
 
-	local function AttachDrag(handle)
+	local function AttachDrag(handle, canDrag)
 		local origin
 		local startCenter
 		self:Pointer(handle, function(input)
-			if self.Locked then
+			if self.Locked or self.Mode3D or (canDrag and not canDrag()) then
 				origin = nil
 				return
 			end
@@ -4883,8 +5798,13 @@ function Graphite:CreateWindow(config)
 			origin = nil
 		end)
 	end
+	self.AttachDrag = AttachDrag
 	AttachDrag(top)
 	AttachDrag(side)
+	AttachDrag(strip, function()
+		return not strip.ScrollingEnabled
+	end)
+	self:MakeFooter()
 
 	local barHeight = Touch and 36 or 30
 	local restore = self:Make("Frame", {
@@ -4927,7 +5847,7 @@ function Graphite:CreateWindow(config)
 	local barCloseButton = GlyphButton(restore, "X", {
 		LayoutOrder = 3,
 		Size = UDim2.fromOffset(buttonWidth, barHeight - 8)
-	})
+	}, Icons.Close)
 
 	local barOrigin
 	local barStart
@@ -4948,6 +5868,30 @@ function Graphite:CreateWindow(config)
 		)
 		self:ClampRestore()
 	end)
+
+	local exit3D = self:Make("TextButton", {
+		Name = "Exit3D",
+		Position = UDim2.new(0, 12, 0, 8),
+		Size = UDim2.fromOffset(92, Touch and 34 or 28),
+		BorderSizePixel = 0,
+		AutoButtonColor = false,
+		ClipsDescendants = true,
+		Font = Enum.Font.GothamMedium,
+		TextSize = 12,
+		Text = "Exit 3D",
+		Visible = false,
+		Parent = gui
+	}, {BackgroundColor3 = "Top", TextColor3 = "Text"})
+	Round(exit3D, 4)
+	self:Stroke(exit3D, "Border")
+	self:Pressable(exit3D, "Top")
+	exit3D.MouseButton1Click:Connect(function()
+		self:SetMode3D(false)
+		if self.Toggle3D then
+			self.Toggle3D:Set(false, true)
+		end
+	end)
+	self.Exit3D = exit3D
 
 	local notes = Create("Frame", {
 		AnchorPoint = Vector2.new(1, 1),
@@ -4999,7 +5943,7 @@ function Graphite:CreateWindow(config)
 
 	local pinchBase
 	self:Connect(UserInputService.TouchPinch, function(positions, pinchScale, _, state)
-		if self.Hidden or self.Closed or not self.PinchEnabled then
+		if self.Hidden or self.Closed or self.Mode3D or not self.PinchEnabled then
 			pinchBase = nil
 			return
 		end
@@ -5016,6 +5960,19 @@ function Graphite:CreateWindow(config)
 
 	self:Connect(gui:GetPropertyChangedSignal("AbsoluteSize"), function()
 		self:OnViewport()
+	end)
+
+	self:Connect(UserInputService.InputChanged, function(input)
+		local press = self.TouchPress
+		if press and press.input == input then
+			local moved = input.Position - press.origin
+			if moved.Magnitude > 8 then
+				self.TouchPress = nil
+				if press.applied then
+					Animate(press.button, {BackgroundColor3 = self.Theme[press.base]}, 0.1)
+				end
+			end
+		end
 	end)
 
 	self:BuildTopTabs(config)
