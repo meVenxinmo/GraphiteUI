@@ -850,6 +850,61 @@ function Window:DropIn()
 	end)
 end
 
+function Window:ApplyAlpha()
+	local panel = self.PanelAlpha or 0
+	if self.TopBar then
+		self.TopBar.BackgroundTransparency = panel
+	end
+	if self.Side then
+		self.Side.BackgroundTransparency = panel
+	end
+	if self.Footer then
+		self.Footer.BackgroundTransparency = panel
+	end
+	local kept = {}
+	for _, row in ipairs(self.Rows) do
+		if row.Parent then
+			row.BackgroundTransparency = self.RowAlpha or 0
+			row:SetAttribute("Goal", self.RowAlpha or 0)
+			table.insert(kept, row)
+		end
+	end
+	self.Rows = kept
+end
+
+function Window:SetBackground(image, opacity)
+	local id = ParseImage(image)
+	if opacity then
+		self.BackOpacity = math.clamp(opacity, 0, 1)
+	end
+	self.BackImageId = id
+	local label = self.BackImage
+	if id then
+		label.Image = id
+		label.ImageTransparency = 1 - self.BackOpacity
+		label.Visible = true
+	else
+		label.Visible = false
+		label.Image = ""
+	end
+	self.PanelAlpha = id and 0.25 or 0
+	self.RowAlpha = id and 0.2 or 0
+	self:ApplyAlpha()
+end
+
+function Window:Redraw()
+	local main = self.Main
+	if self.Hidden or not main.Visible then
+		return
+	end
+	main.Visible = false
+	task.defer(function()
+		if not self.Closed and not self.Hidden then
+			main.Visible = true
+		end
+	end)
+end
+
 function Window:Start3D()
 	self.Links3D = {}
 	local function Link(signal, handler)
@@ -990,6 +1045,7 @@ function Window:Stop3D()
 	local saved = self.Saved2D
 	self.Main.Parent = self.Gui
 	self.Main.AnchorPoint = Vector2.new(0.5, 0.5)
+	self:Redraw()
 	if saved then
 		self.Main.Size = saved.Size
 		self.Main.Position = saved.Position
@@ -1098,6 +1154,7 @@ function Window:SetMode3D(state)
 		math.min(self.Saved2D.Size.X.Offset, Canvas3D.X - 24),
 		math.min(self.Saved2D.Size.Y.Offset, Canvas3D.Y - 24)
 	)
+	self:Redraw()
 	self.TargetScale = 1
 	if not self.Hidden then
 		self.UIScale.Scale = 1
@@ -1147,6 +1204,7 @@ function Window:MakeFooter()
 		BorderSizePixel = 0,
 		Active = true,
 		ZIndex = 60,
+		BackgroundTransparency = self.PanelAlpha or 0,
 		Parent = self.Main
 	}, {BackgroundColor3 = "Top"})
 	self:Make("Frame", {
@@ -1626,7 +1684,9 @@ function Window:ShowKeyGate(options, done)
 	end
 
 	for index = 1, linkCount do
-		MakeButton(linkCount > 1 and ("Get Key " .. index) or "Get Key", index, function()
+		local base = config.GetText or config.CopyText or "Get Key"
+		local label = (type(config.LinkNames) == "table" and config.LinkNames[index]) or (linkCount > 1 and (base .. " " .. index) or base)
+		MakeButton(label, index, function()
 			local link = links[index]
 			if linkBox then
 				linkBox.Text = link
@@ -1671,7 +1731,7 @@ function Window:ShowKeyGate(options, done)
 		end)
 	end
 
-	MakeButton("Check Key", total, Submit)
+	MakeButton(config.CheckText or "Check Key", total, Submit)
 	keyBox.FocusLost:Connect(function(enter)
 		if enter then
 			Submit()
@@ -2020,7 +2080,7 @@ function Window:RequestClose()
 	end)
 end
 
-function Window:Destroy(immediate)
+function Window:Destroy()
 	if self.Closed then
 		return
 	end
@@ -2028,6 +2088,13 @@ function Window:Destroy(immediate)
 		self:Stop3D()
 	end
 	self.Closed = true
+	local registry = GlobalEnv().GraphiteActive
+	if type(registry) == "table" then
+		local at = table.find(registry, self)
+		if at then
+			table.remove(registry, at)
+		end
+	end
 	if ActiveWindow == self then
 		ActiveWindow = nil
 	end
@@ -2036,16 +2103,12 @@ function Window:Destroy(immediate)
 	end
 	self.Restore.Visible = false
 	self:CloseDialog()
+	Animate(self.UIScale, {Scale = self.UIScale.Scale * 0.85}, 0.2)
+	Animate(self.Main, {GroupTransparency = 1}, 0.2)
 	local gui = self.Gui
-	if immediate then
+	task.delay(0.3, function()
 		gui:Destroy()
-	else
-		Animate(self.UIScale, {Scale = self.UIScale.Scale * 0.85}, 0.2)
-		Animate(self.Main, {GroupTransparency = 1}, 0.2)
-		task.delay(0.3, function()
-			gui:Destroy()
-		end)
-	end
+	end)
 	Fire(self.OnClose)
 end
 
@@ -2400,6 +2463,11 @@ function Window:SelectTab(tab)
 		other.Page.Visible = other.Active
 		other.Render(0.14)
 	end
+	for _, child in ipairs(self.Content:GetChildren()) do
+		if child ~= tab.Page and child:IsA("ScrollingFrame") then
+			child.Visible = false
+		end
+	end
 	self.CurrentTab = tab
 	if not tab.IsSettings then
 		self.LastContentTab = tab
@@ -2535,7 +2603,7 @@ function Window:CreateTab(name, icon)
 	return tab
 end
 
-local function NewRow(tab, height, class)
+local function NewRow(tab, height, class, image)
 	tab.Order = tab.Order + 1
 	local row = tab.Window:Make(class or "Frame", {
 		Size = UDim2.new(1, 0, 0, height),
@@ -2551,6 +2619,21 @@ local function NewRow(tab, height, class)
 	Round(row, 4)
 	tab.Window:Stroke(row, "Stroke", 0.6)
 	local win = tab.Window
+	row.BackgroundTransparency = win.RowAlpha or 0
+	table.insert(win.Rows, row)
+	if image then
+		local picture = Create("ImageLabel", {
+			Name = "RowImage",
+			Size = UDim2.fromScale(1, 1),
+			BackgroundTransparency = 1,
+			Image = ParseImage(image),
+			ScaleType = Enum.ScaleType.Crop,
+			ImageTransparency = 0.55,
+			ZIndex = 0,
+			Parent = row
+		})
+		Round(picture, 4)
+	end
 	if win:IsFresh() and tab.Page.Visible then
 		win:Reveal(row, math.min(tab.Order, 10) * 0.03)
 	end
@@ -2972,7 +3055,7 @@ function Tab:CreateButton(config)
 	config = config or {}
 	local win = self.Window
 	local height = config.Description and (RowHeight + 20) or (RowHeight + 6)
-	local row = NewRow(self, height, "TextButton")
+	local row = NewRow(self, height, "TextButton", config.Image)
 	local label, note = RowLabel(win, row, config.Name or "Button", 84, config.Icon, config.Description, config.KeepIconColor)
 	label.Font = Enum.Font.GothamMedium
 	label.TextSize = 14
@@ -3069,7 +3152,7 @@ function Tab:CreateToggle(config)
 	config = config or {}
 	local win = self.Window
 	local state = config.Default == true
-	local row = NewRow(self, config.Description and (RowHeight + 14) or RowHeight, "TextButton")
+	local row = NewRow(self, config.Description and (RowHeight + 14) or RowHeight, "TextButton", config.Image)
 	RowLabel(win, row, config.Name or "Toggle", 70, config.Icon, config.Description, config.KeepIconColor)
 	Hover(win, row)
 	win:Pressable(row)
@@ -3177,7 +3260,7 @@ function Tab:CreateSlider(config)
 	end
 	local stepper = config.Stepper ~= false
 	local reserve = stepper and 148 or 92
-	local row = NewRow(self, RowHeight + 52)
+	local row = NewRow(self, RowHeight + 52, nil, config.Image)
 
 	local title = RowLabel(win, row, config.Name or "Slider", 24, config.Icon, nil, config.KeepIconColor)
 	title.Font = Enum.Font.GothamMedium
@@ -4088,6 +4171,11 @@ function Window:SelectTop(entry)
 			other.Page.Visible = other.Active
 		end
 	end
+	for _, child in ipairs(self.TopContent:GetChildren()) do
+		if child ~= entry.Page and child:IsA("ScrollingFrame") then
+			child.Visible = false
+		end
+	end
 	self.TopSelected = entry
 	self.OnTop = entry.Page ~= nil
 	self:ApplyBody()
@@ -4942,6 +5030,10 @@ function Window:RestoreDefaults()
 		self.Watermark:SetVisible(false)
 	end
 	self:SetMode3D(false)
+	self:SetBackground(nil)
+	if self.BackInput then
+		self.BackInput:Set("", true)
+	end
 	self:SetBorderThickness(1)
 	self.Depth = 7
 	self.TiltMax = 12
@@ -5188,6 +5280,47 @@ function Window:CreateSettingsTab(name, icon)
 		end
 	})
 
+	tab:CreateSection("Background")
+	self.BackInput = tab:CreateInput({
+		Name = "Image ID",
+		Placeholder = "Image ID or empty",
+		Default = "",
+		Flag = "GraphiteBackground",
+		Callback = function(text)
+			local value = string.gsub(tostring(text or ""), "%s", "")
+			if value == "" then
+				self:SetBackground(nil)
+			else
+				self:SetBackground(value)
+			end
+		end
+	})
+	self.BackSlider = tab:CreateSlider({
+		Name = "Image Opacity",
+		Min = 10,
+		Max = 100,
+		Increment = 5,
+		Default = 40,
+		Suffix = "%",
+		Flag = "GraphiteBackOpacity",
+		Callback = function(value)
+			self.BackOpacity = value / 100
+			if self.BackImageId then
+				self:SetBackground(self.BackImageId, value / 100)
+			end
+		end
+	})
+	tab:CreateButton({
+		Name = "Clear Background",
+		Description = "Remove the menu image",
+		Callback = function()
+			self:SetBackground(nil)
+			if self.BackInput then
+				self.BackInput:Set("", true)
+			end
+		end
+	})
+
 	tab:CreateSection("Window")
 	self.ZoomSlider = tab:CreateSlider({
 		Name = "Menu Zoom",
@@ -5417,9 +5550,6 @@ Graphite.Icons = Icons
 
 function Graphite:CreateWindow(config)
 	config = config or {}
-	if config.ReplaceExisting ~= false and ActiveWindow and not ActiveWindow.Closed then
-		ActiveWindow:Destroy(true)
-	end
 	local self = setmetatable({}, Window)
 	self.Name = config.Name or "Graphite"
 	self.Flags = {}
@@ -5464,7 +5594,7 @@ function Graphite:CreateWindow(config)
 	self.Created = os.clock()
 	self.ConfirmTeleport = config.ConfirmTeleport ~= false
 	self.BorderThickness = 1
-	self.Depth = config.Depth or 7
+	self.Depth = 7
 	self.TiltMax = 12
 	self.FollowMode = "Character"
 	self.Mode3D = false
@@ -5473,10 +5603,30 @@ function Graphite:CreateWindow(config)
 	self.Fly = 0
 	self.Away = 0
 	self.Leaving = false
+	self.Rows = {}
+	self.PanelAlpha = 0
+	self.RowAlpha = 0
+	self.BackOpacity = 0.4
 	self.FileName = config.FileName or "Bio.Menu.txt"
 	local shared = GlobalEnv()
 	self.Source = config.Source or shared.GraphiteSourceText
 	shared.GraphiteWindows = (shared.GraphiteWindows or 0) + 1
+	local active = shared.GraphiteActive
+	if type(active) ~= "table" then
+		active = {}
+		shared.GraphiteActive = active
+	end
+	if config.AllowDuplicates ~= true then
+		for index = #active, 1, -1 do
+			local other = active[index]
+			if other and other ~= self and not other.Closed and other.Name == self.Name then
+				pcall(function()
+					other:Destroy()
+				end)
+			end
+		end
+	end
+	table.insert(active, self)
 	if type(shared.GraphiteSaved) == "table" then
 		self.Pending = shared.GraphiteSaved
 		shared.GraphiteSaved = nil
@@ -5536,6 +5686,16 @@ function Graphite:CreateWindow(config)
 		Animate(main, {GroupTransparency = 0}, 0.25)
 	end
 
+	self.BackImage = Create("ImageLabel", {
+		Name = "Background",
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		ScaleType = Enum.ScaleType.Crop,
+		Visible = false,
+		ZIndex = 0,
+		Parent = main
+	})
+
 	local top = self:Make("Frame", {
 		Name = "Top",
 		Size = UDim2.new(1, 0, 0, TopHeight),
@@ -5544,6 +5704,7 @@ function Graphite:CreateWindow(config)
 		Parent = main
 	}, {BackgroundColor3 = "Top"})
 
+	self.TopBar = top
 	local titleOffset = 14
 	local windowIcon = ParseImage(config.Icon)
 	if windowIcon then
@@ -5983,6 +6144,9 @@ function Graphite:CreateWindow(config)
 	end)
 
 	self:BuildTopTabs(config)
+	if config.Background then
+		self:SetBackground(config.Background, config.BackgroundOpacity)
+	end
 
 	if gate then
 		self:RunGate(gate)
