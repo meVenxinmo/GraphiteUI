@@ -463,7 +463,7 @@ end
 function Window:SetLocked(state)
 	self.Locked = state == true
 	if self.Grip then
-		self.Grip.Visible = not self.Locked and not self.Focus
+		self.Grip.Visible = not self.Locked and not self.Focus and not self.Mode3D
 	end
 	if self.LockToggle then
 		self.LockToggle:Set(self.Locked, true)
@@ -804,16 +804,14 @@ function Window:Fly3D(hide)
 	if hide then
 		self:Tween3D("Fly", 1, 0.6, Enum.EasingStyle.Quad, Enum.EasingDirection.In, function()
 			if self.Token == token and self.Hidden and self.Mode3D then
-				self.Main.Visible = false
+				self.Body.Visible = false
 				self:ShowBar3D(true)
 			end
 		end)
 	else
 		self:ShowBar3D(false)
 		self:EnsureLogo()
-		self.Main.Visible = true
-		self.Main.GroupTransparency = self.Fade
-		self.UIScale.Scale = self.TargetScale
+		self.Body.Visible = true
 		self:Tween3D("Fly", 0, 0.75, Enum.EasingStyle.Back, Enum.EasingDirection.Out, nil)
 	end
 end
@@ -1043,9 +1041,22 @@ function Window:Stop3D()
 		self:ClampRestore()
 	end
 	local saved = self.Saved2D
-	self.Main.Parent = self.Gui
-	self.Main.AnchorPoint = Vector2.new(0.5, 0.5)
-	self:Redraw()
+	local holder = self.Holder
+	self.Body = self.Main
+	if holder then
+		for _, child in ipairs(self.Moved3D or {}) do
+			if child.Parent == holder then
+				child.Parent = self.Main
+			end
+		end
+		holder:Destroy()
+	end
+	self.Holder = nil
+	self.Moved3D = nil
+	self.Main.Visible = not self.Hidden
+	if self.Grip then
+		self.Grip.Visible = not self.Locked and not self.Focus and not self.Mode3D
+	end
 	if saved then
 		self.Main.Size = saved.Size
 		self.Main.Position = saved.Position
@@ -1147,14 +1158,36 @@ function Window:SetMode3D(state)
 	self.Part = part
 	self.Surface = surface
 	self.Saved2D = {Size = main.Size, Position = main.Position, Scale = self.TargetScale}
-	main.Parent = surface
-	main.AnchorPoint = Vector2.new(0.5, 0.5)
-	main.Position = UDim2.fromScale(0.5, 0.5)
-	main.Size = UDim2.fromOffset(
-		math.min(self.Saved2D.Size.X.Offset, Canvas3D.X - 24),
-		math.min(self.Saved2D.Size.Y.Offset, Canvas3D.Y - 24)
-	)
-	self:Redraw()
+	local holder = Create("Frame", {
+		Name = "Body3D",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.fromOffset(
+			math.min(self.Saved2D.Size.X.Offset, Canvas3D.X - 24),
+			math.min(self.Saved2D.Size.Y.Offset, Canvas3D.Y - 24)
+		),
+		BorderSizePixel = 0,
+		ClipsDescendants = true,
+		Parent = surface
+	})
+	self:Paint(holder, "BackgroundColor3", "Main")
+	Round(holder, 4)
+	local moved = {}
+	for _, child in ipairs(main:GetChildren()) do
+		if not child:IsA("UICorner") and not child:IsA("UIScale") then
+			table.insert(moved, child)
+		end
+	end
+	self.Holder = holder
+	self.Moved3D = moved
+	self.Body = holder
+	for _, child in ipairs(moved) do
+		child.Parent = holder
+	end
+	main.Visible = false
+	if self.Grip then
+		self.Grip.Visible = false
+	end
 	self.TargetScale = 1
 	if not self.Hidden then
 		self.UIScale.Scale = 1
@@ -1205,7 +1238,7 @@ function Window:MakeFooter()
 		Active = true,
 		ZIndex = 60,
 		BackgroundTransparency = self.PanelAlpha or 0,
-		Parent = self.Main
+		Parent = self.Body
 	}, {BackgroundColor3 = "Top"})
 	self:Make("Frame", {
 		Size = UDim2.new(1, 0, 0, 1),
@@ -1260,7 +1293,7 @@ function Window:EnsureLogo()
 	local footer = self.Footer
 	local logo = self.Logo
 	local healthy = footer and logo
-		and footer.Parent == self.Main and logo.Parent == footer
+		and footer.Parent == self.Body and logo.Parent == footer
 		and footer.Visible and logo.Visible
 		and logo.Image == LogoImage
 		and (logo.ImageTransparency or 0) == 0
@@ -1885,6 +1918,9 @@ function Window:OnViewport()
 end
 
 function Window:SetScale(value, fromSlider)
+	if self.Mode3D then
+		return
+	end
 	value = math.clamp(value, 0.5, 1.6)
 	self.TargetScale = value
 	if not self.Hidden then
@@ -1976,7 +2012,7 @@ function Window:Dialog(config)
 		BorderSizePixel = 0,
 		Active = true,
 		ZIndex = 100,
-		Parent = inside and self.Main or self.Gui
+		Parent = inside and self.Body or self.Gui
 	})
 	self.ActiveDialog = overlay
 	if inside then
@@ -4936,7 +4972,7 @@ function Window:SetFocusMode(state)
 	self.Focus = state == true
 	self:SetSidebar(not self.Focus)
 	if self.Grip then
-		self.Grip.Visible = not self.Locked and not self.Focus
+		self.Grip.Visible = not self.Locked and not self.Focus and not self.Mode3D
 	end
 end
 
@@ -5675,6 +5711,7 @@ function Graphite:CreateWindow(config)
 	}, {BackgroundColor3 = "Main"})
 	Round(main, 4)
 	self.Main = main
+	self.Body = main
 	self.UIScale = Create("UIScale", {Scale = self.TargetScale * 0.85, Parent = main})
 	local gate = PendingLoad
 	PendingLoad = nil
@@ -5917,7 +5954,7 @@ function Graphite:CreateWindow(config)
 	local resizeStart
 	local resizeCorner
 	self:Pointer(grip, function(input)
-		if self.Locked then
+		if self.Locked or self.Mode3D then
 			resizeOrigin = nil
 			return
 		end
