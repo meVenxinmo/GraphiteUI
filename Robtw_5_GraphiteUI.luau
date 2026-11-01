@@ -201,6 +201,18 @@ local function MakeTab(tab)
         local name = type(config) == "table" and config.Name or tostring(config)
         return self:AddLeftGroupbox(name)
     end
+    function adapter:UpdateWarningBox(config)
+        config = config or {}
+        if config.Visible == false then
+            return
+        end
+        if self.GraphiteTab and self.GraphiteTab.CreateParagraph then
+            self.GraphiteTab:CreateParagraph({
+                Title = config.Title or "Warning",
+                Content = config.Text or config.Description or ""
+            })
+        end
+    end
     local function MakeTabbox()
         local tabbox = {Groupboxes = {}}
         function tabbox:AddTab(name)
