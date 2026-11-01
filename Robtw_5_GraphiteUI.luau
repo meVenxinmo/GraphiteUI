@@ -201,6 +201,20 @@ local function MakeTab(tab)
         local name = type(config) == "table" and config.Name or tostring(config)
         return self:AddLeftGroupbox(name)
     end
+    local function MakeTabbox()
+        local tabbox = {Groupboxes = {}}
+        function tabbox:AddTab(name)
+            local group = MakeGroupbox(self.Root, name)
+            self.Groupboxes[name] = group
+            return group
+        end
+        tabbox.Root = self.GraphiteTab
+        return tabbox
+    end
+    function adapter:AddLeftTabbox()
+        return MakeTabbox()
+    end
+    adapter.AddRightTabbox = adapter.AddLeftTabbox
     return adapter
 end
 
